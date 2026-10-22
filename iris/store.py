@@ -1,0 +1,128 @@
+"""Local store. Transcripts+notes kept; recordings auto-deleted after 7 days.
+Encryption at rest lands in v1.5 (age). Layout:
+  store/<meeting-id>/audio.*   (deleted by sweep after RETENTION_DAYS)
+  store/<meeting-id>/transcript.md
+  store/<meeting-id>/notes.md
+  store/<meeting-id>/meta.json"""
+import json, os, shutil, time, uuid
+
+RETENTION_DAYS = 7
+
+def new_meeting(store_dir: str, title: str = "") -> str:
+    mid = time.strftime("%Y%m%d-%H%M") + "-" + uuid.uuid4().hex[:6]
+    os.makedirs(os.path.join(store_dir, mid), exist_ok=True)
+    meta = {"id": mid, "title": title or mid, "created": time.time(), "audio_files": []}
+    _save_meta(store_dir, mid, meta)
+    return mid
+
+def attach_audio(store_dir: str, mid: str, audio_path: str) -> str:
+    ext = os.path.splitext(audio_path)[1].lower()
+    dest = os.path.join(store_dir, mid, "audio" + ext)
+    n = 2
+    while os.path.exists(dest):  # multi-part recordings must not overwrite each other
+        dest = os.path.join(store_dir, mid, f"audio-{n}{ext}"); n += 1
+    shutil.copyfile(audio_path, dest)
+    meta = _load_meta(store_dir, mid)
+    meta["audio_files"].append(os.path.basename(dest))
+    _save_meta(store_dir, mid, meta)
+    return dest
+
+def write_text(store_dir: str, mid: str, name: str, text: str):
+    with open(os.path.join(store_dir, mid, name), "w") as f:
+        f.write(text)
+
+def sweep(store_dir: str, now: float = None, dry_run: bool = False) -> list[str]:
+    """Delete recordings older than RETENTION_DAYS; transcripts and notes stay.
+    dry_run lists what WOULD be deleted without touching anything."""
+    now = now or time.time()
+    deleted = []
+    for mid in list_meetings(store_dir):
+        d = os.path.join(store_dir, mid)
+        try:
+            meta = _load_meta(store_dir, mid)
+        except (OSError, json.JSONDecodeError):
+            continue  # never delete what we can't read
+        if now - meta.get("created", now) < RETENTION_DAYS * 86400: continue
+        for af in meta.get("audio_files", []):
+            p = os.path.join(d, af)
+            if os.path.exists(p):
+                if not dry_run: os.remove(p)
+                deleted.append(p)
+        if dry_run: continue
+        meta["audio_deleted_at"] = now
+        meta["audio_files"] = []
+        _save_meta(store_dir, mid, meta)
+    return deleted
+
+def list_meetings(store_dir: str, reverse: bool = False) -> list[str]:
+    """Meeting ids in the store (dirs with a meta.json), newest-first if reverse."""
+    return sorted((d for d in os.listdir(store_dir)
+                   if os.path.isfile(os.path.join(store_dir, d, "meta.json"))),
+                  reverse=reverse)
+
+def _load_meta(store_dir, mid):
+    return json.load(open(os.path.join(store_dir, mid, "meta.json")))
+
+def _save_meta(store_dir, mid, meta):
+    with open(os.path.join(store_dir, mid, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+"""Encryption wiring (age). When the user has a key (~/.iris/key.txt),
+transcript.md and notes.md are stored as .age ciphertext only - the relay
+and the disk never hold plaintext. Audio is untouched (deleted by sweep)."""
+from iris import crypto as C
+
+PLAINTEXT_FILES = ("transcript.md", "notes.md")
+
+def encrypt_meeting(store_dir: str, mid: str, key_path: str = None) -> list[str]:
+    key_path = key_path or C.DEFAULT_KEY
+    pub = C.public_key(key_path)
+    done = []
+    d = os.path.join(store_dir, mid)
+    for name in PLAINTEXT_FILES:
+        src = os.path.join(d, name)
+        if os.path.exists(src):
+            C.encrypt_file(src, pub)
+            os.remove(src)
+            done.append(name + ".age")
+    meta = _load_meta(store_dir, mid)
+    meta["encrypted"] = True
+    _save_meta(store_dir, mid, meta)
+    return done
+
+def decrypt_meeting(store_dir: str, mid: str, key_path: str = None) -> dict:
+    key_path = key_path or C.DEFAULT_KEY
+    out = {}
+    d = os.path.join(store_dir, mid)
+    for name in PLAINTEXT_FILES:
+        enc = os.path.join(d, name + ".age")
+        if os.path.exists(enc):
+            out[name] = C.decrypt_bytes(open(enc, "rb").read(), key_path).decode()
+    return out
+
+def is_encrypted(store_dir: str, mid: str) -> bool:
+    return bool(_load_meta(store_dir, mid).get("encrypted"))
+
+
+def search(store_dir: str, query: str, key_path: str = None) -> list[dict]:
+    """Full-text search over transcripts + notes (decrypts with local key as
+    needed). Returns [{'meeting': mid, 'file': name, 'line': str}]."""
+    import re
+    hits = []
+    rx = re.compile(re.escape(query), re.I)
+    for mid in list_meetings(store_dir):
+        d = os.path.join(store_dir, mid)
+        if is_encrypted(store_dir, mid):
+            try:
+                texts = decrypt_meeting(store_dir, mid, key_path or C.DEFAULT_KEY)
+            except C.CryptoError:
+                continue  # locked meeting, key not here - search what you can read
+        else:
+            texts = {n: open(os.path.join(d, n)).read()
+                     for n in PLAINTEXT_FILES if os.path.exists(os.path.join(d, n))}
+        for name, text in texts.items():
+            for line in text.splitlines():
+                if rx.search(line):
+                    hits.append({"meeting": mid, "file": name, "line": line.strip()})
+    return hits
