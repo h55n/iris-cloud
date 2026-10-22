@@ -134,7 +134,7 @@ def sidebar(c, user, active=None):
           '<div style="padding:8px 12px"><a href="/login">Log in</a> &middot; <a href="/signup">Sign up</a></div>'
     return ('<input type=checkbox id=navtoggle><label for=navtoggle class=menubtn>Menu</label>'
             '<a href="/" style="text-decoration:none;color:inherit"><div class=brand>Iris<span id=tagline>meeting notes that keep receipts</span></div></a>'
-            + ('<a class="folder" href="/record" style="margin:6px 0"><span class=chev></span>Record a meeting</a>' if user else '')
+            + ('<a class="folder" href="/record" style="margin:6px 0"><span class=chev></span>Backup recorder</a>' if user else '')
             + '<div class=nav>' + (f'<div class=nav-sec>Meetings</div>{items or "<div class=nav-meta style=padding:8px>Nothing recorded yet</div>"}' if user else '') + '</div>'
             + who
             + '<div class=themes><span class=lbl>Theme</span>' + ''.join(
@@ -151,18 +151,30 @@ def render_page(c, user, body, active=None, status=200):
     doc = (PAGE.replace("<!--PWA-->", W.HEAD_TAGS) + inner + W.SW_REGISTER)
     return HTMLResponse(doc, status_code=status)
 
-PRIVACY = ("<p style='color:var(--muted);font-size:13.5px;line-height:1.55'><b>How hosted mode handles your meetings.</b> "
-           "Your recording is sent to Groq to be transcribed (Whisper), and the transcript is sent to an open model at Groq to write the notes. "
-           "We keep the transcript and notes in our database, tied to your account. We do not keep the audio. "
-           "Do not use hosted mode for confidential meetings. For fully private use, "
-           "<a href='https://github.com/h55n/iris'>self-host Iris</a>: there, audio never leaves your own machine.</p>")
+PRIVACY = ("<p style='color:var(--muted);font-size:13.5px;line-height:1.55'><b>Your audio stays on your device.</b> "
+           "The local Iris app records, transcribes and writes the notes on your own machine, with models that run there. "
+           "Only the finished notes sync to this site, tied to your account. Transcripts stay off unless you turn them on in Account, and audio is never uploaded. "
+           "Want ciphertext only? Run <code>iris encrypt</code> locally first and this site will hold notes it cannot read. "
+           "<a href='https://github.com/h55n/iris'>Get the local app</a>.</p>")
+
+BACKUP_PRIVACY = ("<p style='color:var(--muted);font-size:13.5px;line-height:1.55'><b>Backup mode, for devices that cannot run Iris locally.</b> "
+                  "In this mode your recording is sent to Groq to be transcribed (Whisper), and the transcript is sent to an open model at Groq to write the notes. "
+                  "We keep the transcript and notes in our database, tied to your account. We do not keep the audio. "
+                  "Do not use backup mode for confidential meetings. For private use, "
+                  "<a href='https://github.com/h55n/iris'>run Iris locally</a>, where audio never leaves your own machine.</p>")
 
 def landing(c, user):
-    cta = ('<a class=cta href="/record">Record a meeting</a>' if user else
+    cta = ('<a class=cta href="/account">Set up sync</a> <a class=cta2 href="/record">Backup recorder</a>' if user else
            '<a class=cta href="/signup">Create an account</a> <a class=cta2 href="/login">Log in</a>')
+    steps = ("<div style='max-width:520px;margin:0 auto 22px'><p class=eyebrow>How it works</p>"
+             "<ol style='padding-left:20px;line-height:1.7;margin:0'>"
+             "<li>Run Iris on your computer or phone. It records, transcribes and writes the notes there.</li>"
+             "<li>Make a sync token on the Account page.</li>"
+             "<li>Run <code>iris sync --notes-only</code>. Only the notes come here, never the audio.</li>"
+             "<li>Read and edit them from any device, like Notion.</li></ol></div>")
     return (mascot(120, "celebrate") + "<h1 class=title style='text-align:center;font-size:34px'>Iris</h1>"
-            "<p style='text-align:center;color:var(--muted);margin:0 0 18px'>Record a meeting. Get notes where every decision shows the line it came from.</p>"
-            f"<div style='text-align:center;margin-bottom:26px'>{cta}</div>"
+            "<p style='text-align:center;color:var(--muted);margin:0 0 18px'>Meeting notes made on your device, readable anywhere. Every decision shows the line it came from.</p>"
+            f"<div style='text-align:center;margin-bottom:26px'>{cta}</div>" + steps +
             "<style>.cta,.cta2{display:inline-block;padding:10px 20px;border-radius:999px;text-decoration:none;font-weight:600;margin:0 4px}"
             ".cta{background:var(--accent);color:#fff}.cta2{border:1px solid var(--border);color:var(--text)}</style>" + PRIVACY)
 
@@ -187,7 +199,7 @@ def home(req: Request):
         n = c.execute("SELECT count(*) AS n FROM meetings WHERE user_id=%s", (u["id"],)).fetchone()["n"]
         body = landing(c, u) if n == 0 else (
             mascot(96, "happy") + "<h1 class=title style='text-align:center;font-size:28px'>Welcome back</h1>"
-            "<p style='text-align:center'><a class=cta href=/record style='display:inline-block;padding:10px 20px;border-radius:999px;background:var(--accent);color:#fff;text-decoration:none;font-weight:600'>Record a meeting</a></p>"
+            "<p style='text-align:center'><a class=cta href=/record style='display:inline-block;padding:10px 20px;border-radius:999px;background:var(--accent);color:#fff;text-decoration:none;font-weight:600'>Backup recorder</a></p>"
             + PRIVACY)
         return render_page(c, u, body)
 
@@ -345,11 +357,12 @@ def record(req: Request):
         if not u: return RedirectResponse("/login", status_code=303)
         body = ("<style>#rtitle{font:inherit;padding:9px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);width:100%;margin-bottom:12px}"
                 "#rbtn{font:inherit;font-weight:600;padding:10px 18px;border:0;border-radius:999px;background:var(--accent);color:#fff;cursor:pointer}#rbtn:disabled{opacity:.6}</style>"
-                "<h1 class=title style='font-size:30px'>Record a meeting</h1>" + PRIVACY +
+                "<h1 class=title style='font-size:30px'>Backup recorder</h1>" + BACKUP_PRIVACY +
+                '<label style="display:flex;gap:8px;align-items:flex-start;margin:0 0 14px;font-size:14px"><input type=checkbox id=ok style="margin-top:4px"> I understand my audio goes to Groq in this mode.</label>'
                 '<input id=rtitle placeholder="Title (optional)" maxlength=120>'
-                '<div style="display:flex;gap:10px;align-items:center"><button id=rbtn type=button>Start recording</button>'
+                '<div style="display:flex;gap:10px;align-items:center"><button id=rbtn type=button disabled>Start recording</button>'
                 '<span id=rtime style="font-variant-numeric:tabular-nums;color:var(--muted)">00:00</span></div>'
-                '<p id=rmsg style="color:var(--muted);margin-top:14px"></p><p id=rlog style="color:var(--faint);font-size:13px"></p>' + RECORD_JS)
+                '<p id=rmsg style="color:var(--muted);margin-top:14px"></p><p id=rlog style="color:var(--faint);font-size:13px"></p>' + RECORD_JS + "<script>(function(){var ok=document.getElementById('ok'),b=document.getElementById('rbtn');ok.onchange=function(){b.disabled=!ok.checked}})()</script>")
         return render_page(c, u, body)
 
 # ---------- API ----------
@@ -656,7 +669,7 @@ async def account_transcripts(req: Request):
 
 @app.get("/manifest.webmanifest")
 def manifest():
-    m = json.loads(W.MANIFEST); m["shortcuts"] = [{"name": "Record a meeting", "url": "/record"}]
+    m = json.loads(W.MANIFEST); m["shortcuts"] = [{"name": "My notes", "url": "/"}]
     return Response(json.dumps(m), media_type="application/manifest+json")
 
 @app.get("/sw.js")

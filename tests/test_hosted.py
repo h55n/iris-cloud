@@ -201,7 +201,10 @@ def test_static_routes(app_client):
     assert c.get("/manifest.webmanifest").status_code == 200
     assert c.get("/sw.js").status_code == 200
     assert c.get("/icon-192.png").status_code == 200
-    assert "Do not use hosted mode for confidential" in c.get("/login").text
+    assert "Your audio stays on your device" in c.get("/login").text
+    signup(c)
+    rec = c.get("/record").text
+    assert "Backup mode" in rec and "audio goes to Groq" in rec and "Do not use backup mode for confidential" in rec
 
 
 def _token(c, mod):
