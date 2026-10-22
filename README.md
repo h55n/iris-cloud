@@ -12,6 +12,8 @@ The sync endpoints (`/sync/push`, `/sync/list`, `/sync/pull`) speak the same pro
 ## Backup recorder (opt-in)
 For a device that cannot run Iris locally, `/record` records in the browser in 5-minute parts, sends each to Whisper (large-v3-turbo) on Groq's free tier, and an open model on Groq writes the notes, which the Iris verifier then checks quote by quote. In this mode audio goes to Groq. It is not stored by us, but transcripts and notes are. Do not use it for confidential meetings.
 
+The same consent rule covers a second backup: `POST /api/notes` takes a transcript you made locally (`[MM:SS] text` lines, max 16000 characters) with `consent_groq: true` and a sync token, has Groq write the notes, verifies every quote, and returns them. Nothing is stored. 30 calls per user per day.
+
 ## Privacy
 Default path: only notes are stored (and transcripts if you opt in). Backup recorder: audio goes to Groq, as above. Accounts and their data can be deleted from the Account page.
 
