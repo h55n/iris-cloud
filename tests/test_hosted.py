@@ -244,3 +244,44 @@ def test_sync_is_per_user(app_client):
     a.post("/sync/push/m1", json={"id": "m1", "notes": "# A only"}, headers={"X-Iris-Token": ta})
     assert b.get("/sync/pull/m1", headers={"X-Iris-Token": tb}).status_code == 404
     assert b.get("/sync/list", headers={"X-Iris-Token": tb}).json()["meetings"] == []
+
+
+def test_account_tokens_and_viewer(app_client):
+    c = app_client(); signup(c)
+    r = c.post("/account/token", data={"label": "laptop"})
+    import re
+    tok = re.search(r"iris_[A-Za-z0-9_-]{20,}", r.text).group(0)
+    H = {"X-Iris-Token": tok}
+    c.post("/sync/push/m9", json={"id": "m9", "meta": {"title": "Planning <b>", "created": 1700000000}, "notes": "# Planning\n\n## Decisions\n- ship it", "transcript": "[00:00] hi"}, headers=H)
+    page = c.get("/n/m9").text
+    assert "ship it" in page and "Planning &lt;b&gt;" in page and "Planning <b>" not in page
+    assert "[00:00] hi" not in page                      # transcripts are off by default
+    assert "synced" in c.get("/").text
+    c.post("/n/m9/edit", data={"notes": "# Planning\n\n- edited on the web"})
+    pulled = c.get("/sync/pull/m9", headers=H).json()
+    assert "edited on the web" in pulled["notes"] and pulled["meta"]["edited"] > 0
+    c.post("/account/transcripts", data={"on": "1"})
+    c.post("/sync/push/m9", json={"id": "m9", "notes": "# n", "transcript": "[00:00] kept"}, headers=H)
+    assert "kept" in c.get("/n/m9").text
+    c.post("/account/transcripts", data={"on": "0"})
+    assert "transcript" not in c.get("/sync/pull/m9", headers=H).json()
+    c.post("/n/m9/delete")
+    assert c.get("/n/m9").status_code == 404
+
+
+def test_encrypted_notes_are_not_readable_on_site(app_client):
+    c = app_client(); signup(c)
+    H = {"X-Iris-Token": _token(c, app_client.mod)}
+    c.post("/sync/push/e1", json={"id": "e1", "meta": {"title": "Locked"}, "notes_age": "-----BEGIN AGE ENCRYPTED FILE-----"}, headers=H)
+    p = c.get("/n/e1").text
+    assert "encrypted on your device" in p and "BEGIN AGE" not in p
+
+
+def test_revoked_token_stops_working(app_client):
+    c = app_client(); signup(c)
+    import re
+    tok = re.search(r"iris_[A-Za-z0-9_-]{20,}", c.post("/account/token", data={}).text).group(0)
+    assert c.get("/sync/list", headers={"X-Iris-Token": tok}).status_code == 200
+    h = app_client.mod._th(tok)
+    c.post("/account/token/revoke", data={"h": h})
+    assert c.get("/sync/list", headers={"X-Iris-Token": tok}).status_code == 403
