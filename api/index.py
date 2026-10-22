@@ -2,6 +2,7 @@
 path on free-tier services. Whisper runs at Groq; notes are written by an open
 model at Groq, then checked by the same verifier the self-hosted Iris uses."""
 import hashlib, hmac, html, json, os, re, secrets, sys, time
+from urllib.parse import urlparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import httpx, psycopg
@@ -107,6 +108,51 @@ def current_user(c, req: Request):
     tok = req.cookies.get(COOKIE)
     if not tok: return None
     return c.execute("SELECT u.id, u.email FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=%s AND s.expires>now()", (_th(tok),)).fetchone()
+
+# ---------- security: headers, cross-site request refusal, per-IP throttles ----------
+CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+       "media-src 'self' blob:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'")
+
+def client_ip(req: Request) -> str:
+    # Vercel sets these itself, so a caller cannot choose them
+    for h in ("x-vercel-forwarded-for", "x-real-ip", "x-forwarded-for"):
+        v = (req.headers.get(h) or "").split(",")[0].strip()
+        if v: return v[:64]
+    return req.client.host if req.client else "unknown"
+
+@app.middleware("http")
+async def security_layer(req: Request, call_next):
+    if req.method in ("POST", "PUT", "PATCH", "DELETE") and req.cookies.get(COOKIE) and not req.headers.get("x-iris-token") and not req.headers.get("x-convo-token"):
+        origin = req.headers.get("origin"); host = req.headers.get("host") or ""
+        bad = (origin is not None and (origin == "null" or urlparse(origin).netloc != host)) or \
+              (origin is None and req.headers.get("sec-fetch-site") == "cross-site")
+        if bad: return JSONResponse({"error": "cross-site request refused"}, status_code=403)
+    resp = await call_next(req)
+    resp.headers["Content-Security-Policy"] = CSP
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Permissions-Policy"] = "camera=(), geolocation=(), microphone=(self)"
+    if "text/html" in resp.headers.get("content-type", "") or req.url.path.startswith(("/sync", "/api")):
+        resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+IP_LIMITS = {"signup": (10, "1 hour"), "login": (40, "10 minutes"), "reset": (20, "10 minutes")}
+
+def ip_limited(c, req: Request, kind: str) -> bool:
+    limit, window = IP_LIMITS[kind]
+    k = f"ip-{kind}:{client_ip(req)}"
+    n = c.execute("SELECT count(*) AS n FROM login_fail WHERE email=%s AND ts>now()-%s::interval", (k, window)).fetchone()["n"]
+    if n >= limit: return True
+    c.execute("INSERT INTO login_fail(email) VALUES(%s)", (k,))
+    return False
+
+_DUMMY = None
+def burn_hash(pw: str):
+    """Spend the same time on an unknown email as on a real one, so response time does not reveal which emails exist."""
+    global _DUMMY
+    if _DUMMY is None: _DUMMY = hash_pw("not-a-real-password")
+    check_pw(pw, _DUMMY)
 
 EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,}$")
 
@@ -227,6 +273,7 @@ async def signup(req: Request):
         if len(pw) < 8 or len(pw) > 200: return bad("Use a password of 8 to 200 characters.")
         if c.execute("SELECT count(*) AS n FROM users").fetchone()["n"] >= MAX_USERS:
             return bad("Signups are full for now (free-tier limit). Self-hosting Iris is always open.")
+        if ip_limited(c, req, "signup"): return bad("Too many signups from this network. Try again later.")
         rcode, rhash = new_recovery()
         row = c.execute("INSERT INTO users(email,pw_hash,recovery_hash) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING RETURNING id", (email, hash_pw(pw), rhash)).fetchone()
         if not row: return bad("An account with that email already exists. Try logging in.")
@@ -238,7 +285,11 @@ async def login(req: Request):
     with db() as c:
         fails = c.execute("SELECT count(*) AS n FROM login_fail WHERE email=%s AND ts>now()-interval '10 minutes'", (email,)).fetchone()["n"]
         if fails >= 8: return render_page(c, None, auth_form("login", "Too many attempts. Wait ten minutes.", email), status=429)
+        if ip_limited(c, req, "login"):
+            return render_page(c, None, auth_form("login", "Too many attempts from this network. Wait ten minutes.", email), status=429)
+        c.execute("DELETE FROM sessions WHERE expires<now()"); c.execute("DELETE FROM login_fail WHERE ts<now()-interval '1 day'")
         u = c.execute("SELECT id,pw_hash FROM users WHERE email=%s", (email,)).fetchone()
+        if not u: burn_hash(pw)
         if not u or not check_pw(pw, u["pw_hash"]):
             c.execute("INSERT INTO login_fail(email) VALUES(%s)", (email,))
             return render_page(c, None, auth_form("login", "Wrong email or password.", email), status=401)
@@ -258,7 +309,10 @@ async def reset(req: Request):
             return render_page(c, None, reset_form("Too many attempts. Wait ten minutes.", email), status=429)
         if len(pw) < 8 or len(pw) > 200:
             return render_page(c, None, reset_form("Use a password of 8 to 200 characters.", email), status=400)
+        if ip_limited(c, req, "reset"):
+            return render_page(c, None, reset_form("Too many attempts from this network. Wait ten minutes.", email), status=429)
         u = c.execute("SELECT id,recovery_hash FROM users WHERE email=%s", (email,)).fetchone()
+        if not u: burn_hash(code)
         if not u or not u["recovery_hash"] or len(code) != 16 or not check_pw("-".join(code[i:i+4] for i in range(0, 16, 4)), u["recovery_hash"]):
             c.execute("INSERT INTO login_fail(email) VALUES(%s)", (key,))
             return render_page(c, None, reset_form("Email or recovery code is wrong.", email), status=401)
