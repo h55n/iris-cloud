@@ -297,3 +297,10 @@ def test_folders_bundle_is_not_listed_as_a_meeting(app_client):
     c.post("/sync/push/real1", json={"id": "real1", "meta": {"title": "Real one"}, "notes": "# r"}, headers=H)
     side = c.get("/").text
     assert "Real one" in side and ">_folders<" not in side
+
+
+def test_legacy_android_token_header_works(app_client):
+    c = app_client(); signup(c)
+    tok = _token(c, app_client.mod)
+    assert c.post("/sync/push/a1", json={"id": "a1", "meta": {"title": "From phone"}, "notes": "# p"}, headers={"X-Convo-Token": tok}).status_code == 200
+    assert c.get("/sync/list", headers={"X-Convo-Token": tok}).json()["meetings"][0]["id"] == "a1"
