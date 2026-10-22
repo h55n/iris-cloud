@@ -288,3 +288,12 @@ def test_revoked_token_stops_working(app_client):
     h = app_client.mod._th(tok)
     c.post("/account/token/revoke", data={"h": h})
     assert c.get("/sync/list", headers={"X-Iris-Token": tok}).status_code == 403
+
+
+def test_folders_bundle_is_not_listed_as_a_meeting(app_client):
+    c = app_client(); signup(c)
+    H = {"X-Iris-Token": _token(c, app_client.mod)}
+    c.post("/sync/push/_folders", json={"id": "_folders", "folders": []}, headers=H)
+    c.post("/sync/push/real1", json={"id": "real1", "meta": {"title": "Real one"}, "notes": "# r"}, headers=H)
+    side = c.get("/").text
+    assert "Real one" in side and ">_folders<" not in side
