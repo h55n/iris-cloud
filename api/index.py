@@ -121,7 +121,7 @@ def sidebar(c, user, active=None):
         st = "" if m["status"] == "done" else f' &middot; {esc(m["status"])}'
         items += (f'<a class="nav-item{" active" if m["id"] == active else ""}" href="/m/{m["id"]}">'
                   f'<div class=nav-title>{esc(m["title"] or "Untitled meeting")}</div><div class=nav-meta>{when}{st}{iv}</div></a>')
-    srows = c.execute("SELECT id, bundle->'meta'->>'title' AS title, bundle->'meta'->>'created' AS created, server_ts FROM synced WHERE user_id=%s ORDER BY server_ts DESC LIMIT 60", (user["id"],)).fetchall() if user else []
+    srows = c.execute("SELECT id, bundle->'meta'->>'title' AS title, bundle->'meta'->>'created' AS created, server_ts FROM synced WHERE user_id=%s AND id NOT LIKE '\\_%%' ORDER BY server_ts DESC LIMIT 60", (user["id"],)).fetchall() if user else []
     if srows:
         items += "<div class=nav-sec style='margin-top:10px'>From your devices</div>"
         for m in srows:
@@ -130,7 +130,9 @@ def sidebar(c, user, active=None):
             items += (f'<a class="nav-item{" active" if "n:" + m["id"] == active else ""}" href="/n/{esc(m["id"])}">'
                       f'<div class=nav-title>{esc(m["title"] or m["id"])}</div><div class=nav-meta>{when} &middot; synced</div></a>')
     who = (f'<div class=nav-sec>Signed in</div><div class=nav-meta style="padding:2px 12px 8px">{esc(user["email"])}</div>'
-           '<a class=mi href="/account" style="display:block;padding:0 12px">Account</a><form method=post action="/logout" style="padding:0 12px"><button class=mi>Log out</button></form>') if user else \
+           '<a class=wl href="/account">Account</a><form method=post action="/logout" style="margin:0"><button class=wl>Log out</button></form>'
+           '<style>.wl{display:block;width:100%;text-align:left;padding:6px 12px;border:0;background:transparent;color:var(--text);font:inherit;font-size:14px;text-decoration:none;border-radius:6px;cursor:pointer}.wl:hover{background:var(--active-bg)}'
+           'form+form,.doc form button{margin-top:0}.doc p+form,.doc form+form{margin-top:12px}.doc form button{margin-top:10px}</style>') if user else \
           '<div style="padding:8px 12px"><a href="/login">Log in</a> &middot; <a href="/signup">Sign up</a></div>'
     return ('<input type=checkbox id=navtoggle><label for=navtoggle class=menubtn>Menu</label>'
             '<a href="/" style="text-decoration:none;color:inherit"><div class=brand>Iris<span id=tagline>meeting notes that keep receipts</span></div></a>'
@@ -609,7 +611,7 @@ def synced_note(mid: str, req: Request):
         except Exception: when = ""
         page = (f"<h1 class=title style='font-size:28px'>{esc(title)}</h1><div class=props><span>{when}</span><span>Synced from your device. No audio is stored here.</span></div>"
                 + body + tr + edit
-                + f'<form method=post action="/n/{esc(mid)}/delete" style="margin-top:24px" onsubmit="return confirm(\'Remove from the cloud? Your local copy stays.\')"><button class=mi style="color:#b3261e;cursor:pointer">Remove from cloud</button></form>')
+                + f'<form method=post action="/n/{esc(mid)}/delete" style="margin-top:24px" onsubmit="return confirm(\'Remove from the cloud? Your local copy stays.\')"><button style="border:1px solid var(--border);background:transparent;color:#b3261e;cursor:pointer;font:inherit;font-size:13px;padding:6px 14px;border-radius:999px">Remove from cloud</button></form>')
         return render_page(c, u, page, active="n:" + mid)
 
 @app.post("/n/{mid}/edit")
