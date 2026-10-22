@@ -316,3 +316,27 @@ def test_part_offsets_come_from_audio_length(app_client):
     with app_client.mod.db() as db:
         segs = db.execute("SELECT segs FROM meetings WHERE id=%s", (mid,)).fetchone()["segs"]
     assert max(s["start"] for s in segs) < 20          # 9 s of audio per part, so part 2 starts at 9 s, not 9999
+
+
+def test_notes_backup_needs_consent_and_a_token(app_client):
+    c = app_client(); signup(c)
+    H = {"X-Iris-Token": _token(c, app_client.mod)}
+    tr = "[00:00] Priya will own the sync server.\n[00:04] We decided recordings delete after seven days."
+    assert c.post("/api/notes", json={"transcript": tr}, headers=H).status_code == 400            # no consent
+    assert c.post("/api/notes", json={"transcript": tr, "consent_groq": True}, headers={"X-Iris-Token": "bad"}).status_code == 403
+    assert c.post("/api/notes", json={"transcript": "no timestamps", "consent_groq": True}, headers=H).status_code == 400
+    r = c.post("/api/notes", json={"transcript": tr, "consent_groq": True}, headers=H)
+    assert r.status_code == 200, r.text
+    assert r.json()["integrity"]["checked"] == r.json()["integrity"]["passed"] >= 2 and "Priya" in r.json()["notes_md"]
+
+
+def test_notes_backup_daily_limit(app_client):
+    c = app_client(); signup(c)
+    H = {"X-Iris-Token": _token(c, app_client.mod)}
+    tr = "[00:00] Priya will own the sync server."
+    app_client.mod.MAX_NOTES_CALLS_PER_DAY = 1
+    try:
+        assert c.post("/api/notes", json={"transcript": tr, "consent_groq": True}, headers=H).status_code == 200
+        assert c.post("/api/notes", json={"transcript": tr, "consent_groq": True}, headers=H).status_code == 429
+    finally:
+        app_client.mod.MAX_NOTES_CALLS_PER_DAY = 30
