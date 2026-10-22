@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS login_fail(email text, ts timestamptz DEFAULT now());
 CREATE TABLE IF NOT EXISTS meetings(id text PRIMARY KEY, user_id bigint REFERENCES users(id) ON DELETE CASCADE, title text NOT NULL DEFAULT '',
   created timestamptz DEFAULT now(), status text NOT NULL DEFAULT 'recording', segs jsonb NOT NULL DEFAULT '[]', seg_count int NOT NULL DEFAULT 0,
   notes_md text NOT NULL DEFAULT '', integrity jsonb, error text);
+ALTER TABLE meetings ADD COLUMN IF NOT EXISTS parts jsonb NOT NULL DEFAULT '[]';
 CREATE INDEX IF NOT EXISTS meetings_user ON meetings(user_id, created DESC);
 """
 _ready = False
@@ -299,10 +300,26 @@ async def api_segment(mid: str, req: Request, index: int = 0, offset: float = 0)
     limits = {k: v for k, v in r.headers.items() if k.lower().startswith("x-ratelimit") or k.lower() == "retry-after"}
     segs = [{"start": float(s["start"]) + offset, "end": float(s["end"]) + offset, "text": s["text"].strip(), "lang": r.json().get("language")}
             for s in r.json().get("segments", []) if s.get("text", "").strip()]
+    part = {"index": index, "t0": offset, "t1": max([x["end"] for x in segs], default=offset)}
+    if segs:
+        try: part["notes"] = await _part_notes(segs, key)
+        except Exception as e: part["error"] = str(e)[:140]
     with db() as c:
-        c.execute("UPDATE meetings SET segs = segs || %s::jsonb, seg_count = seg_count + 1 WHERE id=%s AND user_id=%s", (json.dumps(segs), mid, u["id"]))
+        c.execute("UPDATE meetings SET segs = segs || %s::jsonb, parts = parts || %s::jsonb, seg_count = seg_count + 1 WHERE id=%s AND user_id=%s", (json.dumps(segs), json.dumps([part]), mid, u["id"]))
         total = c.execute("SELECT jsonb_array_length(segs) AS n FROM meetings WHERE id=%s", (mid,)).fetchone()["n"]
     return {"segments": total, "added": len(segs), "limits": limits}
+
+async def _chat(prompt: str, key: str, json_mode: bool = True) -> str:
+    body = {"model": NOTES_MODEL, "temperature": 0.2, "messages": [{"role": "user", "content": prompt}]}
+    if json_mode: body["response_format"] = {"type": "json_object"}
+    async with httpx.AsyncClient(timeout=50) as h:
+        r = await h.post(f"{GROQ}/chat/completions", headers={"Authorization": f"Bearer {key}"}, json=body)
+    if r.status_code == 429: raise RuntimeError("notes model is busy (free-tier rate limit)")
+    if r.status_code != 200: raise RuntimeError(f"notes model error {r.status_code}: {r.text[:140]}")
+    return r.json()["choices"][0]["message"]["content"]
+
+async def _part_notes(segs: list, key: str) -> dict:
+    return _parse_notes(await _chat(NOTES_PROMPT + transcript_markdown(segs)[:16000], key))
 
 def _parse_notes(raw: str) -> dict:
     raw = raw.strip()
@@ -327,17 +344,29 @@ async def api_finish(mid: str, req: Request):
             c.execute("UPDATE meetings SET status='done', notes_md=%s WHERE id=%s", ("_No speech was detected in this recording._", mid))
             return {"id": mid, "empty": True}
         c.execute("UPDATE meetings SET status='writing notes' WHERE id=%s", (mid,))
-    tmd = transcript_markdown(segs)
     try:
-        async with httpx.AsyncClient(timeout=55) as h:
-            r = await h.post(f"{GROQ}/chat/completions", headers={"Authorization": f"Bearer {key}"},
-                             json={"model": NOTES_MODEL, "temperature": 0.2, "response_format": {"type": "json_object"},
-                                   "messages": [{"role": "user", "content": NOTES_PROMPT + tmd[:60000]}]})
-        if r.status_code != 200: raise RuntimeError(f"notes model error {r.status_code}: {r.text[:160]}")
-        notes = verify.verify_notes(_parse_notes(r.json()["choices"][0]["message"]["content"]), segs)
+        parts = sorted(m["parts"], key=lambda p: p["t0"])
+        notes_list = []
+        for p in parts:
+            if "notes" not in p:   # retry a part whose notes call was rate-limited
+                sub = [x for x in segs if p["t0"] - 0.01 <= x["start"] <= p["t1"] + 0.01]
+                if not sub: continue
+                p["notes"] = await _part_notes(sub, key)
+            notes_list.append(p["notes"])
+        summaries = [n.get("summary", "") for n in notes_list if n.get("summary")]
+        if len(summaries) > 1:
+            try:
+                summary = (await _chat("Write a 2-3 sentence summary of this meeting from its section summaries. Plain text only.\n\n" + "\n".join(summaries)[:12000], key, json_mode=False)).strip()
+            except Exception:
+                summary = " ".join(summaries)[:600]
+        else:
+            summary = summaries[0] if summaries else ""
+        merged = {"summary": summary, "decisions": [d for n in notes_list for d in n.get("decisions", [])],
+                  "action_items": [a for n in notes_list for a in n.get("action_items", [])]}
+        notes = verify.verify_notes(merged, segs)
         md = render.render_notes(mid, notes, segs)
         with db() as c:
-            c.execute("UPDATE meetings SET status='done', notes_md=%s, integrity=%s, error=NULL WHERE id=%s", (md, json.dumps(notes.get("integrity")), mid))
+            c.execute("UPDATE meetings SET status='done', notes_md=%s, integrity=%s, error=NULL, parts=%s WHERE id=%s", (md, json.dumps(notes.get("integrity")), json.dumps(parts), mid))
         return {"id": mid, "integrity": notes.get("integrity")}
     except Exception as e:
         with db() as c:
@@ -354,8 +383,10 @@ def meeting(mid: str, req: Request):
         if not m: return render_page(c, u, "<p>Not found.</p>", status=404)
         segs = sorted(m["segs"], key=lambda s: s["start"])
         tmd = transcript_markdown(segs) if segs else ""
+        retry = ("<p><button id=retry class=cta style='border:0;cursor:pointer;font:inherit;font-weight:600;padding:9px 18px;border-radius:999px;background:var(--accent);color:#fff'>Try writing the notes again</button></p>"
+                 f"<script>document.getElementById('retry').onclick=async function(){{this.disabled=true;this.textContent='Working...';var r=await fetch('/api/meetings/{mid}/finish',{{method:'POST'}});location.reload()}}</script>") if (m["status"] in ("error", "writing notes") and segs) else ""
         notes_html = render_notes_md(m["notes_md"]) if m["notes_md"] else (
-            f"<p style='color:var(--muted)'>Status: {esc(m['status'])}" + (f" - {esc(m['error'])}" if m["error"] else "") + "</p>")
+            f"<p style='color:var(--muted)'>Status: {esc(m['status'])}" + (f" - {esc(m['error'])}" if m["error"] else "") + "</p>" + retry)
         tr = "".join(render_transcript_line(l) for l in tmd.splitlines() if l.strip())
         body = ((mascot(110, "celebrate") + "<div class=empty style='padding-top:0'><div class=t>Meeting saved</div></div>") if m["status"] == "done" and (time.time() - m["created"].timestamp()) < 600 else "")
         body += (f'<form method=post action="/m/{mid}/rename" style="margin:0"><input name=title class=title value="{esc(m["title"] or "Untitled meeting")}" maxlength=120 style="width:100%" aria-label="Title" onchange="this.form.submit()"></form>'
