@@ -671,6 +671,47 @@ async def account_transcripts(req: Request):
             c.execute("UPDATE synced SET bundle = bundle - 'transcript' - 'transcript_age' WHERE user_id=%s", (u["id"],))
     return RedirectResponse("/account", status_code=303)
 
+# ---------- opt-in backup: write notes from a transcript made on your own device ----------
+MAX_NOTES_CALLS_PER_DAY = 30
+TS_LINE = re.compile(r"^\[(\d+):(\d\d)\]\s*(?:\*\*[^*]+\*\*:?\s*)?(.+)$")
+
+def parse_transcript(text: str) -> list:
+    segs = []
+    for line in text.splitlines():
+        m = TS_LINE.match(line.strip())
+        if m:
+            t = int(m.group(1)) * 60 + int(m.group(2))
+            segs.append({"start": float(t), "end": float(t) + 3.0, "text": m.group(3).strip()})
+    for a, b in zip(segs, segs[1:]):
+        a["end"] = max(a["start"] + 1.0, b["start"])
+    return segs
+
+@app.post("/api/notes")
+async def api_notes(req: Request):
+    """Backup path for a device that can make a transcript but not the notes. The transcript text goes to Groq,
+    so the caller must say so. Audio is never involved. Nothing is stored."""
+    key = os.environ.get("GROQ_API_KEY", "")
+    if not key: return _err("notes backup is not configured", 503)
+    try: body = await req.json()
+    except Exception: return _err("bad json", 400)
+    if body.get("consent_groq") is not True: return _err("send consent_groq: true; the transcript text is sent to Groq to write the notes", 400)
+    text = (body.get("transcript") or "")
+    if len(text) > 16000: return _err("transcript too long for the backup path (16000 characters)", 413)
+    segs = parse_transcript(text)
+    if not segs: return _err("no [MM:SS] transcript lines found", 400)
+    with db() as c:
+        u = token_user(c, req)
+        if not u: return _err("bad token", 403)
+        k = f"notes:{u['id']}"
+        if c.execute("SELECT count(*) AS n FROM login_fail WHERE email=%s AND ts>now()-interval '1 day'", (k,)).fetchone()["n"] >= MAX_NOTES_CALLS_PER_DAY:
+            return _err("daily limit for the notes backup reached", 429)
+        c.execute("INSERT INTO login_fail(email) VALUES(%s)", (k,))
+    try:
+        notes = verify.verify_notes(await _part_notes(segs, key), segs)
+    except Exception as e:
+        return _err(str(e)[:200], 502)
+    return {"notes_md": render.render_notes("notes", notes, segs), "integrity": notes.get("integrity")}
+
 @app.get("/manifest.webmanifest")
 def manifest():
     m = json.loads(W.MANIFEST); m["shortcuts"] = [{"name": "My notes", "url": "/"}]
