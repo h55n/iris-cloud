@@ -202,3 +202,45 @@ def test_static_routes(app_client):
     assert c.get("/sw.js").status_code == 200
     assert c.get("/icon-192.png").status_code == 200
     assert "Do not use hosted mode for confidential" in c.get("/login").text
+
+
+def _token(c, mod):
+    """Make an API token directly, the way the account page does."""
+    import secrets
+    tok = secrets.token_urlsafe(24)
+    with mod.db() as db:
+        uid = db.execute("SELECT id FROM users ORDER BY id DESC LIMIT 1").fetchone()["id"]
+        db.execute("INSERT INTO api_tokens(token_hash,user_id) VALUES(%s,%s)", (mod._th(tok), uid))
+    return tok
+
+
+def test_sync_protocol_notes_only(app_client):
+    c = app_client(); signup(c)
+    tok = _token(c, app_client.mod); H = {"X-Iris-Token": tok}
+    b = {"id": "20261022-1000-abc123", "meta": {"title": "Standup", "created": 1.0}, "notes": "# Standup\n\n- decided x",
+         "transcript": "[00:00] secret words"}
+    r = c.post("/sync/push/20261022-1000-abc123", json=b, headers=H)
+    assert r.status_code == 200 and r.json()["transcript_dropped"] is True
+    lst = c.get("/sync/list?since=0", headers=H).json()["meetings"]
+    assert [m["id"] for m in lst] == ["20261022-1000-abc123"]
+    got = c.get("/sync/pull/20261022-1000-abc123", headers=H).json()
+    assert got["notes"].startswith("# Standup") and "transcript" not in got
+    assert c.get(f"/sync/list?since={lst[0]['ts'] + 1}", headers=H).json()["meetings"] == []
+
+
+def test_sync_rejects_audio_bad_token_and_bad_ids(app_client):
+    c = app_client(); signup(c)
+    H = {"X-Iris-Token": _token(c, app_client.mod)}
+    assert c.post("/sync/push/x1", json={"id": "x1", "audio_b64": "AAAA"}, headers=H).status_code == 400
+    assert c.post("/sync/push/..%2Fx", json={"id": "x"}, headers=H).status_code in (400, 404)
+    assert c.post("/sync/push/x2", json={"id": "x2"}, headers={"X-Iris-Token": "nope"}).status_code == 403
+    assert c.get("/sync/list").status_code == 403
+
+
+def test_sync_is_per_user(app_client):
+    a, b = app_client(), app_client()
+    signup(a); ta = _token(a, app_client.mod)
+    signup(b); tb = _token(b, app_client.mod)
+    a.post("/sync/push/m1", json={"id": "m1", "notes": "# A only"}, headers={"X-Iris-Token": ta})
+    assert b.get("/sync/pull/m1", headers={"X-Iris-Token": tb}).status_code == 404
+    assert b.get("/sync/list", headers={"X-Iris-Token": tb}).json()["meetings"] == []
