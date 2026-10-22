@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS meetings(id text PRIMARY KEY, user_id bigint REFERENC
   created timestamptz DEFAULT now(), status text NOT NULL DEFAULT 'recording', segs jsonb NOT NULL DEFAULT '[]', seg_count int NOT NULL DEFAULT 0,
   notes_md text NOT NULL DEFAULT '', integrity jsonb, error text);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_hash text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS keep_transcripts boolean NOT NULL DEFAULT false;
+CREATE TABLE IF NOT EXISTS api_tokens(token_hash text PRIMARY KEY, user_id bigint REFERENCES users(id) ON DELETE CASCADE, label text NOT NULL DEFAULT '', created timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS synced(user_id bigint REFERENCES users(id) ON DELETE CASCADE, id text NOT NULL, bundle jsonb NOT NULL, server_ts double precision NOT NULL, PRIMARY KEY(user_id,id));
 ALTER TABLE meetings ADD COLUMN IF NOT EXISTS parts jsonb NOT NULL DEFAULT '[]';
 CREATE INDEX IF NOT EXISTS meetings_user ON meetings(user_id, created DESC);
 """
@@ -489,6 +492,60 @@ def delete(mid: str, req: Request):
     return RedirectResponse("/", status_code=303)
 
 # ---------- installable app ----------
+
+# ---------- device sync: the same relay protocol the local Iris client speaks ----------
+MAX_BUNDLE = 600_000            # bytes per synced meeting
+MAX_SYNCED = 500                # synced meetings per user
+TRANSCRIPT_KEYS = ("transcript", "transcript_age")
+AUDIO_KEYS = ("audio", "audio_b64", "audio_files_b64")
+
+def token_user(c, req: Request):
+    tok = req.headers.get("x-iris-token") or ""
+    if not tok: return None
+    return c.execute("SELECT u.id, u.email, u.keep_transcripts FROM api_tokens t JOIN users u ON u.id=t.user_id WHERE t.token_hash=%s", (_th(tok),)).fetchone()
+
+def _sid_ok(mid): return bool(re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", mid)) and ".." not in mid
+
+@app.post("/sync/push/{mid}")
+async def sync_push(mid: str, req: Request):
+    raw = await req.body()
+    if len(raw) > MAX_BUNDLE: return _err("meeting too large to sync", 413)
+    with db() as c:
+        u = token_user(c, req)
+        if not u: return _err("bad token", 403)
+        if not _sid_ok(mid): return _err("bad id", 400)
+        try: b = json.loads(raw)
+        except Exception: return _err("bad json", 400)
+        if not isinstance(b, dict): return _err("bad bundle", 400)
+        if any(k in b for k in AUDIO_KEYS): return _err("audio never syncs", 400)
+        dropped = False
+        if not u["keep_transcripts"]:
+            for k in TRANSCRIPT_KEYS:
+                if k in b: b.pop(k); dropped = True
+        have = c.execute("SELECT 1 FROM synced WHERE user_id=%s AND id=%s", (u["id"], mid)).fetchone()
+        if not have and c.execute("SELECT count(*) AS n FROM synced WHERE user_id=%s", (u["id"],)).fetchone()["n"] >= MAX_SYNCED:
+            return _err("synced meeting limit reached", 429)
+        ts = time.time(); b["_server_ts"] = ts
+        c.execute("INSERT INTO synced(user_id,id,bundle,server_ts) VALUES(%s,%s,%s,%s) ON CONFLICT (user_id,id) DO UPDATE SET bundle=EXCLUDED.bundle, server_ts=EXCLUDED.server_ts",
+                  (u["id"], mid, json.dumps(b), ts))
+        return {"ok": True, "id": mid, "transcript_dropped": dropped}
+
+@app.get("/sync/list")
+def sync_list(req: Request, since: float = 0.0):
+    with db() as c:
+        u = token_user(c, req)
+        if not u: return _err("bad token", 403)
+        rows = c.execute("SELECT id, server_ts FROM synced WHERE user_id=%s AND server_ts>%s ORDER BY id", (u["id"], since)).fetchall()
+        return {"meetings": [{"id": r["id"], "ts": r["server_ts"]} for r in rows]}
+
+@app.get("/sync/pull/{mid}")
+def sync_pull(mid: str, req: Request):
+    with db() as c:
+        u = token_user(c, req)
+        if not u: return _err("bad token", 403)
+        r = c.execute("SELECT bundle FROM synced WHERE user_id=%s AND id=%s", (u["id"], mid)).fetchone()
+        return r["bundle"] if r else _err("not found", 404)
+
 @app.get("/manifest.webmanifest")
 def manifest():
     m = json.loads(W.MANIFEST); m["shortcuts"] = [{"name": "Record a meeting", "url": "/record"}]
