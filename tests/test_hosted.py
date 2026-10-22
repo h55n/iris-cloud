@@ -30,7 +30,7 @@ class FakeClient:
     async def __aexit__(self, *a): return False
     async def post(self, url, **kw):
         if url.endswith("/audio/transcriptions"):
-            return FakeResp(200, {"language": "en", "segments": TRANSCRIPT}, {"x-ratelimit-limit-requests": "2000"})
+            return FakeResp(200, {"language": "en", "duration": 9.0, "segments": TRANSCRIPT}, {"x-ratelimit-limit-requests": "2000"})
         FakeClient.chat_calls += 1
         if FakeClient.chat_fail: return FakeResp(429, {})
         body = kw["json"]
@@ -304,3 +304,14 @@ def test_legacy_android_token_header_works(app_client):
     tok = _token(c, app_client.mod)
     assert c.post("/sync/push/a1", json={"id": "a1", "meta": {"title": "From phone"}, "notes": "# p"}, headers={"X-Convo-Token": tok}).status_code == 200
     assert c.get("/sync/list", headers={"X-Convo-Token": tok}).json()["meetings"][0]["id"] == "a1"
+
+
+def test_part_offsets_come_from_audio_length(app_client):
+    c = app_client(); signup(c)
+    mid = c.post("/api/meetings", json={}).json()["id"]
+    audio = b"x" * 2000
+    c.post(f"/api/meetings/{mid}/segment?index=0&offset=0", content=audio, headers={"content-type": "audio/webm"})
+    c.post(f"/api/meetings/{mid}/segment?index=1&offset=9999", content=audio, headers={"content-type": "audio/webm"})
+    with app_client.mod.db() as db:
+        segs = db.execute("SELECT segs FROM meetings WHERE id=%s", (mid,)).fetchone()["segs"]
+    assert max(s["start"] for s in segs) < 20          # 9 s of audio per part, so part 2 starts at 9 s, not 9999
