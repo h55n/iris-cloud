@@ -48,6 +48,7 @@ def app_client(monkeypatch):
     A._ready = False
     monkeypatch.setattr(A.httpx, "AsyncClient", FakeClient)
     monkeypatch.setattr(A, "MAX_USERS", 10**9)
+    monkeypatch.setattr(A, "IP_LIMITS", {"signup": (10**9, "1 hour"), "login": (10**9, "1 minute"), "reset": (10**9, "1 minute")})
     FakeClient.chat_calls = 0; FakeClient.chat_fail = False
     def make():
         return TestClient(A.app, base_url="https://testserver", follow_redirects=False)
@@ -340,3 +341,63 @@ def test_notes_backup_daily_limit(app_client):
         assert c.post("/api/notes", json={"transcript": tr, "consent_groq": True}, headers=H).status_code == 429
     finally:
         app_client.mod.MAX_NOTES_CALLS_PER_DAY = 30
+
+
+def test_security_headers_and_no_store(app_client):
+    c = app_client(); signup(c)
+    r = c.get("/account")
+    h = r.headers
+    assert "frame-ancestors 'none'" in h["content-security-policy"] and "script-src 'self'" in h["content-security-policy"]
+    assert h["x-content-type-options"] == "nosniff" and h["x-frame-options"] == "DENY" and h["referrer-policy"] == "no-referrer"
+    assert h["cache-control"] == "no-store"
+    assert "no-store" in c.get("/sync/list").headers["cache-control"]
+
+
+def test_cross_site_posts_with_a_session_cookie_are_refused(app_client):
+    c = app_client(); email, pw, _ = signup(c)
+    mid = c.post("/api/meetings", json={}).json()["id"]
+    for hdr in ({"Origin": "https://evil.example"}, {"Origin": "null"}, {"Sec-Fetch-Site": "cross-site"}):
+        assert c.post(f"/m/{mid}/delete", headers=hdr).status_code == 403
+        assert c.post("/account/delete", data={"password": pw}, headers=hdr).status_code == 403
+        assert c.post("/account/token", data={}, headers=hdr).status_code == 403
+    assert c.get(f"/m/{mid}").status_code == 200                       # nothing was deleted
+    assert c.post(f"/m/{mid}/rename", data={"title": "ok"}, headers={"Origin": "https://testserver"}).status_code == 303
+    assert c.post("/logout", headers={"Sec-Fetch-Site": "same-origin"}).status_code == 303
+
+
+def test_per_ip_throttles(app_client):
+    A = app_client.mod
+    A.IP_LIMITS["signup"] = (2, "1 hour"); A.IP_LIMITS["login"] = (3, "1 hour"); A.IP_LIMITS["reset"] = (2, "1 hour")
+    c = app_client()
+    # clear earlier counts for this client address
+    with A.db() as db: db.execute("DELETE FROM login_fail WHERE email LIKE 'ip-%%'")
+    assert signup(c)[2].status_code == 200 and signup(c)[2].status_code == 200
+    assert signup(c)[2].status_code == 400
+    for _ in range(3):
+        c.post("/login", data={"email": "nobody@iris-cloud.invalid", "password": "wrong-wrong"})
+    assert c.post("/login", data={"email": "other@iris-cloud.invalid", "password": "wrong-wrong"}).status_code == 429
+    for _ in range(2):
+        c.post("/reset", data={"email": "n1@iris-cloud.invalid", "code": "0000-0000-0000-0000", "password": "brand-new-pass"})
+    assert c.post("/reset", data={"email": "n2@iris-cloud.invalid", "code": "0000-0000-0000-0000", "password": "brand-new-pass"}).status_code == 429
+
+
+def test_notes_and_titles_are_escaped_in_the_viewer(app_client):
+    c = app_client(); signup(c)
+    H = {"X-Iris-Token": _token(c, app_client.mod)}
+    evil = '<script>alert(1)</script>"><img src=x onerror=alert(1)>'
+    c.post("/sync/push/x1", json={"id": "x1", "meta": {"title": evil}, "notes": "# t\n- " + evil, "transcript": "[00:00] " + evil}, headers=H)
+    c.post("/account/transcripts", data={"on": "1"})
+    c.post("/sync/push/x1", json={"id": "x1", "meta": {"title": evil}, "notes": "# t\n- " + evil + "\n> \"" + evil + "\" 00:01", "transcript": "[00:00] " + evil}, headers=H)
+    for page in (c.get("/n/x1").text, c.get("/").text):
+        assert "<script>alert(1)" not in page and "<img src=x onerror" not in page
+    mid = c.post("/api/meetings", json={"title": evil}).json()["id"]
+    assert "<img src=x onerror" not in c.get(f"/m/{mid}").text
+    c.post("/n/x1/edit", data={"notes": evil})
+    assert "<script>alert(1)" not in c.get("/n/x1").text
+
+
+def test_login_response_does_not_reveal_which_emails_exist(app_client):
+    c = app_client(); email, pw, _ = signup(c)
+    a = c.post("/login", data={"email": email, "password": "wrong-wrong"})
+    b = c.post("/login", data={"email": "ghost@iris-cloud.invalid", "password": "wrong-wrong"})
+    assert a.status_code == b.status_code == 401 and "Wrong email or password" in a.text and "Wrong email or password" in b.text
