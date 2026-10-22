@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS login_fail(email text, ts timestamptz DEFAULT now());
 CREATE TABLE IF NOT EXISTS meetings(id text PRIMARY KEY, user_id bigint REFERENCES users(id) ON DELETE CASCADE, title text NOT NULL DEFAULT '',
   created timestamptz DEFAULT now(), status text NOT NULL DEFAULT 'recording', segs jsonb NOT NULL DEFAULT '[]', seg_count int NOT NULL DEFAULT 0,
   notes_md text NOT NULL DEFAULT '', integrity jsonb, error text);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_hash text;
 ALTER TABLE meetings ADD COLUMN IF NOT EXISTS parts jsonb NOT NULL DEFAULT '[]';
 CREATE INDEX IF NOT EXISTS meetings_user ON meetings(user_id, created DESC);
 """
@@ -66,6 +67,32 @@ def check_pw(pw: str, stored: str) -> bool:
     except Exception:
         return False
 
+def new_recovery():
+    raw = secrets.token_hex(8).upper()
+    code = "-".join(raw[i:i+4] for i in range(0, 16, 4))
+    return code, hash_pw(code)
+
+def norm_code(c): return re.sub(r"[^0-9A-F]", "", (c or "").upper())
+
+def recovery_page(code, dest="/record"):
+    return ("<h1 class=title style='font-size:28px'>Save your recovery code</h1>"
+            "<p>There is no email on this free version, so this code is the only way to reset a forgotten password. "
+            "It is shown once. Copy it somewhere safe.</p>"
+            f"<p style='font:600 22px ui-monospace,monospace;letter-spacing:.06em;padding:14px;border:1px dashed var(--border);border-radius:10px;text-align:center' id=rc>{code}</p>"
+            f"<p><a class=cta href='{dest}' style='display:inline-block;padding:10px 20px;border-radius:999px;background:var(--accent);color:#fff;text-decoration:none;font-weight:600'>I saved it, continue</a></p>")
+
+def reset_form(err="", email="", ok=""):
+    msg = (f"<p style='color:var(--danger,#b3261e)'>{esc(err)}</p>" if err else "") + (f"<p>{esc(ok)}</p>" if ok else "")
+    return ("<h1 class=title style='font-size:30px'>Reset password</h1>" + msg
+            + '<form method=post action="/reset" style="display:flex;flex-direction:column;gap:10px;max-width:340px">'
+              f'<input name=email type=email required placeholder="Email" value="{esc(email)}" class=f>'
+              '<input name=code required placeholder="Recovery code (XXXX-XXXX-XXXX-XXXX)" autocomplete=off class=f>'
+              '<input name=password type=password required minlength=8 placeholder="New password (8+ characters)" autocomplete=new-password class=f>'
+              '<button class=cta style="border:0;cursor:pointer;font:inherit;font-weight:600">Reset password</button></form>'
+              "<style>.f{font:inherit;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)}"
+              ".cta{display:inline-block;padding:10px 20px;border-radius:999px;background:var(--accent);color:#fff}</style>"
+              "<p style='color:var(--muted)'>Lost the code too? There is no way to recover the account. Create a new one.</p>")
+
 def _th(tok): return hashlib.sha256(tok.encode()).hexdigest()
 
 def start_session(c, user_id, resp):
@@ -92,7 +119,7 @@ def sidebar(c, user, active=None):
         items += (f'<a class="nav-item{" active" if m["id"] == active else ""}" href="/m/{m["id"]}">'
                   f'<div class=nav-title>{esc(m["title"] or "Untitled meeting")}</div><div class=nav-meta>{when}{st}{iv}</div></a>')
     who = (f'<div class=nav-sec>Signed in</div><div class=nav-meta style="padding:2px 12px 8px">{esc(user["email"])}</div>'
-           '<form method=post action="/logout" style="padding:0 12px"><button class=mi>Log out</button></form>') if user else \
+           '<a class=mi href="/account" style="display:block;padding:0 12px">Account</a><form method=post action="/logout" style="padding:0 12px"><button class=mi>Log out</button></form>') if user else \
           '<div style="padding:8px 12px"><a href="/login">Log in</a> &middot; <a href="/signup">Sign up</a></div>'
     return ('<input type=checkbox id=navtoggle><label for=navtoggle class=menubtn>Menu</label>'
             '<a href="/" style="text-decoration:none;color:inherit"><div class=brand>Iris<span id=tagline>meeting notes that keep receipts</span></div></a>'
@@ -130,7 +157,7 @@ def landing(c, user):
 
 def auth_form(kind, err="", email=""):
     t = "Create your account" if kind == "signup" else "Log in"
-    other = ('<a href="/login">Have an account? Log in</a>' if kind == "signup" else '<a href="/signup">New here? Create an account</a>')
+    other = ('<a href="/login">Have an account? Log in</a>' if kind == "signup" else '<a href="/signup">New here? Create an account</a> &middot; <a href="/reset">Forgot password?</a>')
     return (f"<h1 class=title style='font-size:30px'>{t}</h1>"
             + (f"<p style='color:var(--danger,#b3261e)'>{esc(err)}</p>" if err else "")
             + f'<form method=post action="/{kind}" style="display:flex;flex-direction:column;gap:10px;max-width:340px">'
@@ -175,9 +202,10 @@ async def signup(req: Request):
         if len(pw) < 8 or len(pw) > 200: return bad("Use a password of 8 to 200 characters.")
         if c.execute("SELECT count(*) AS n FROM users").fetchone()["n"] >= MAX_USERS:
             return bad("Signups are full for now (free-tier limit). Self-hosting Iris is always open.")
-        row = c.execute("INSERT INTO users(email,pw_hash) VALUES(%s,%s) ON CONFLICT DO NOTHING RETURNING id", (email, hash_pw(pw))).fetchone()
+        rcode, rhash = new_recovery()
+        row = c.execute("INSERT INTO users(email,pw_hash,recovery_hash) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING RETURNING id", (email, hash_pw(pw), rhash)).fetchone()
         if not row: return bad("An account with that email already exists. Try logging in.")
-        resp = RedirectResponse("/record", status_code=303); start_session(c, row["id"], resp); return resp
+        resp = render_page(c, None, recovery_page(rcode)); start_session(c, row["id"], resp); return resp
 
 @app.post("/login")
 async def login(req: Request):
@@ -190,6 +218,53 @@ async def login(req: Request):
             c.execute("INSERT INTO login_fail(email) VALUES(%s)", (email,))
             return render_page(c, None, auth_form("login", "Wrong email or password.", email), status=401)
         resp = RedirectResponse("/", status_code=303); start_session(c, u["id"], resp); return resp
+
+@app.get("/reset", response_class=HTMLResponse)
+def reset_page(req: Request):
+    with db() as c: return render_page(c, current_user(c, req), reset_form())
+
+@app.post("/reset")
+async def reset(req: Request):
+    f = await _form(req); email = (f.get("email") or "").strip().lower(); pw = f.get("password") or ""
+    code = norm_code(f.get("code"))
+    with db() as c:
+        key = "reset:" + email
+        if c.execute("SELECT count(*) AS n FROM login_fail WHERE email=%s AND ts>now()-interval '10 minutes'", (key,)).fetchone()["n"] >= 5:
+            return render_page(c, None, reset_form("Too many attempts. Wait ten minutes.", email), status=429)
+        if len(pw) < 8 or len(pw) > 200:
+            return render_page(c, None, reset_form("Use a password of 8 to 200 characters.", email), status=400)
+        u = c.execute("SELECT id,recovery_hash FROM users WHERE email=%s", (email,)).fetchone()
+        if not u or not u["recovery_hash"] or len(code) != 16 or not check_pw("-".join(code[i:i+4] for i in range(0, 16, 4)), u["recovery_hash"]):
+            c.execute("INSERT INTO login_fail(email) VALUES(%s)", (key,))
+            return render_page(c, None, reset_form("Email or recovery code is wrong.", email), status=401)
+        rcode, rhash = new_recovery()
+        c.execute("UPDATE users SET pw_hash=%s, recovery_hash=%s WHERE id=%s", (hash_pw(pw), rhash, u["id"]))
+        c.execute("DELETE FROM sessions WHERE user_id=%s", (u["id"],))
+        resp = render_page(c, None, "<p>Password changed. Your old code is used up, so here is a new one.</p>" + recovery_page(rcode, "/"))
+        start_session(c, u["id"], resp); return resp
+
+@app.post("/account/delete")
+async def account_delete(req: Request):
+    f = await _form(req)
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        row = c.execute("SELECT pw_hash FROM users WHERE id=%s", (u["id"],)).fetchone()
+        if not check_pw(f.get("password") or "", row["pw_hash"]):
+            return render_page(c, u, "<p style='color:var(--danger,#b3261e)'>Wrong password. Nothing was deleted.</p>", status=401)
+        c.execute("DELETE FROM users WHERE id=%s", (u["id"],))
+        resp = RedirectResponse("/", status_code=303); resp.delete_cookie(COOKIE, path="/"); return resp
+
+@app.get("/account", response_class=HTMLResponse)
+def account(req: Request):
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        return render_page(c, u, "<h1 class=title style='font-size:28px'>Account</h1>"
+            "<p>Deleting your account removes your meetings, transcripts and notes from the database. This cannot be undone.</p>"
+            '<form method=post action="/account/delete" style="display:flex;flex-direction:column;gap:10px;max-width:340px">'
+            '<input name=password type=password required placeholder="Confirm password" class=f style="font:inherit;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)">'
+            '<button style="border:0;cursor:pointer;font:inherit;font-weight:600;padding:10px 20px;border-radius:999px;background:#b3261e;color:#fff">Delete my account</button></form>')
 
 @app.post("/logout")
 def logout(req: Request):

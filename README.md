@@ -14,7 +14,7 @@ Self-hosting (fully private, audio never leaves your machine) lives in [h55n/iri
 Audio is sent to Groq for transcription and is not stored by us. Transcripts and notes are stored in our database, tied to your account. Do not use hosted mode for confidential meetings; self-host instead.
 
 ## Limits (free tier)
-200 accounts, 20 meetings per user per day, 3h20 per meeting, plus Groq's free rate limits. No email verification or password reset yet.
+200 accounts, 20 meetings per user per day, 3h20 per meeting, plus Groq's free rate limits. No email verification (no free mail sender). Password reset works with a recovery code shown once at signup; lose both and the account is gone. Accounts can be deleted from the Account page.
 
 ## Deploy your own
 Vercel project, a Neon Postgres (`DATABASE_URL`), and `GROQ_API_KEY`. `vercel.json` routes everything to `api/index.py`.
