@@ -47,6 +47,7 @@ def app_client(monkeypatch):
     import api.index as A
     A._ready = False
     monkeypatch.setattr(A.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(A, "MAX_USERS", 10**9)
     FakeClient.chat_calls = 0; FakeClient.chat_fail = False
     def make():
         return TestClient(A.app, base_url="https://testserver", follow_redirects=False)
