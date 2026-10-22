@@ -121,6 +121,14 @@ def sidebar(c, user, active=None):
         st = "" if m["status"] == "done" else f' &middot; {esc(m["status"])}'
         items += (f'<a class="nav-item{" active" if m["id"] == active else ""}" href="/m/{m["id"]}">'
                   f'<div class=nav-title>{esc(m["title"] or "Untitled meeting")}</div><div class=nav-meta>{when}{st}{iv}</div></a>')
+    srows = c.execute("SELECT id, bundle->'meta'->>'title' AS title, bundle->'meta'->>'created' AS created, server_ts FROM synced WHERE user_id=%s ORDER BY server_ts DESC LIMIT 60", (user["id"],)).fetchall() if user else []
+    if srows:
+        items += "<div class=nav-sec style='margin-top:10px'>From your devices</div>"
+        for m in srows:
+            try: when = time.strftime("%b %-d, %H:%M UTC", time.gmtime(float(m["created"] or m["server_ts"])))
+            except Exception: when = "synced"
+            items += (f'<a class="nav-item{" active" if "n:" + m["id"] == active else ""}" href="/n/{esc(m["id"])}">'
+                      f'<div class=nav-title>{esc(m["title"] or m["id"])}</div><div class=nav-meta>{when} &middot; synced</div></a>')
     who = (f'<div class=nav-sec>Signed in</div><div class=nav-meta style="padding:2px 12px 8px">{esc(user["email"])}</div>'
            '<a class=mi href="/account" style="display:block;padding:0 12px">Account</a><form method=post action="/logout" style="padding:0 12px"><button class=mi>Log out</button></form>') if user else \
           '<div style="padding:8px 12px"><a href="/login">Log in</a> &middot; <a href="/signup">Sign up</a></div>'
@@ -263,10 +271,23 @@ def account(req: Request):
     with db() as c:
         u = current_user(c, req)
         if not u: return RedirectResponse("/login", status_code=303)
+        keep = c.execute("SELECT keep_transcripts FROM users WHERE id=%s", (u["id"],)).fetchone()["keep_transcripts"]
+        toks = c.execute("SELECT token_hash,label,created FROM api_tokens WHERE user_id=%s ORDER BY created", (u["id"],)).fetchall()
+        btn = "border:0;cursor:pointer;font:inherit;font-weight:600;padding:9px 18px;border-radius:999px;background:var(--accent);color:#fff"
+        inp = "font:inherit;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)"
+        rows = "".join(f'<li style="margin:6px 0">{esc(t["label"] or "token")} <span style="color:var(--muted)">&middot; made {t["created"].strftime("%b %-d")}</span> '
+                       f'<form method=post action="/account/token/revoke" style="display:inline"><input type=hidden name=h value="{t["token_hash"]}"><button style="border:0;background:none;color:#b3261e;cursor:pointer;font:inherit">Revoke</button></form></li>' for t in toks)
         return render_page(c, u, "<h1 class=title style='font-size:28px'>Account</h1>"
-            "<p>Deleting your account removes your meetings, transcripts and notes from the database. This cannot be undone.</p>"
-            '<form method=post action="/account/delete" style="display:flex;flex-direction:column;gap:10px;max-width:340px">'
-            '<input name=password type=password required placeholder="Confirm password" class=f style="font:inherit;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)">'
+            "<h2 class=big>Sync from your devices</h2>"
+            "<p>Your local Iris app turns audio into notes on your own machine, then sends only the notes here. Make a token for each device.</p>"
+            f"<ul style='padding-left:18px'>{rows or '<li style=color:var(--muted)>No tokens yet.</li>'}</ul>"
+            f'<form method=post action="/account/token" style="display:flex;gap:8px;flex-wrap:wrap;max-width:420px"><input name=label placeholder="Device name (optional)" style="{inp};flex:1;min-width:160px"><button style="{btn}">Make a token</button></form>'
+            "<h2 class=big style='margin-top:28px'>Transcripts</h2>"
+            f"<p>Off by default: only notes are stored. Turn on to also keep transcripts for your synced meetings. Turning it off deletes the stored transcripts. Currently <b>{'on' if keep else 'off'}</b>.</p>"
+            f'<form method=post action="/account/transcripts"><input type=hidden name=on value="{0 if keep else 1}"><button style="{btn}">{"Turn off and delete stored transcripts" if keep else "Turn on"}</button></form>'
+            "<h2 class=big style='margin-top:28px'>Delete account</h2>"
+            "<p>Removes your meetings, synced notes and tokens from the database. This cannot be undone.</p>"
+            f'<form method=post action="/account/delete" style="display:flex;flex-direction:column;gap:10px;max-width:340px"><input name=password type=password required placeholder="Confirm password" style="{inp}">'
             '<button style="border:0;cursor:pointer;font:inherit;font-weight:600;padding:10px 20px;border-radius:999px;background:#b3261e;color:#fff">Delete my account</button></form>')
 
 @app.post("/logout")
@@ -545,6 +566,93 @@ def sync_pull(mid: str, req: Request):
         if not u: return _err("bad token", 403)
         r = c.execute("SELECT bundle FROM synced WHERE user_id=%s AND id=%s", (u["id"], mid)).fetchone()
         return r["bundle"] if r else _err("not found", 404)
+
+# ---------- synced notes (viewer and editor) ----------
+@app.get("/n/{mid}", response_class=HTMLResponse)
+def synced_note(mid: str, req: Request):
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        r = c.execute("SELECT bundle FROM synced WHERE user_id=%s AND id=%s", (u["id"], mid)).fetchone()
+        if not r: return render_page(c, u, "<p>Not found.</p>", status=404)
+        b = r["bundle"]; meta = b.get("meta") or {}
+        title = meta.get("title") or mid
+        if "notes" in b:
+            body = render_notes_md(b["notes"])
+            edit = (f'<details class=drawer><summary>Edit notes</summary><form method=post action="/n/{esc(mid)}/edit">'
+                    f'<textarea name=notes rows=16 style="width:100%;font:13.5px/1.5 ui-monospace,monospace;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)">{esc(b["notes"])}</textarea>'
+                    '<p><button style="border:0;cursor:pointer;font:inherit;font-weight:600;padding:9px 18px;border-radius:999px;background:var(--accent);color:#fff">Save</button> '
+                    '<span style="color:var(--muted);font-size:13px">Your devices get the edit on their next sync.</span></p></form></details>')
+        elif "notes_age" in b:
+            body = ("<p style='color:var(--muted)'>These notes were encrypted on your device before syncing, so this site cannot read them. "
+                    "Open them in the local Iris app or the Android app, which hold your key.</p>"); edit = ""
+        else:
+            body = "<p style='color:var(--muted)'>No notes in this synced meeting yet.</p>"; edit = ""
+        tr = ""
+        if b.get("transcript"):
+            tr = (f'<details class=drawer><summary>Transcript</summary><div class=tr>'
+                  + "".join(render_transcript_line(l) for l in b["transcript"].splitlines() if l.strip()) + "</div></details>")
+        try: when = time.strftime("%B %-d, %Y %H:%M UTC", time.gmtime(float(meta.get("created") or b.get("_server_ts"))))
+        except Exception: when = ""
+        page = (f"<h1 class=title style='font-size:28px'>{esc(title)}</h1><div class=props><span>{when}</span><span>Synced from your device. No audio is stored here.</span></div>"
+                + body + tr + edit
+                + f'<form method=post action="/n/{esc(mid)}/delete" style="margin-top:24px" onsubmit="return confirm(\'Remove from the cloud? Your local copy stays.\')"><button class=mi style="color:#b3261e;cursor:pointer">Remove from cloud</button></form>')
+        return render_page(c, u, page, active="n:" + mid)
+
+@app.post("/n/{mid}/edit")
+async def synced_edit(mid: str, req: Request):
+    f = await _form(req); text = (f.get("notes") or "")[:200_000]
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        r = c.execute("SELECT bundle FROM synced WHERE user_id=%s AND id=%s", (u["id"], mid)).fetchone()
+        if not r or "notes" not in r["bundle"]: return render_page(c, u, "<p>Not found.</p>", status=404)
+        b = r["bundle"]; now = time.time(); b["notes"] = text
+        b.setdefault("meta", {})["edited"] = now; b["_server_ts"] = now
+        c.execute("UPDATE synced SET bundle=%s, server_ts=%s WHERE user_id=%s AND id=%s", (json.dumps(b), now, u["id"], mid))
+    return RedirectResponse(f"/n/{mid}", status_code=303)
+
+@app.post("/n/{mid}/delete")
+def synced_delete(mid: str, req: Request):
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        c.execute("DELETE FROM synced WHERE user_id=%s AND id=%s", (u["id"], mid))
+    return RedirectResponse("/", status_code=303)
+
+@app.post("/account/token")
+async def account_token(req: Request):
+    f = await _form(req)
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        if c.execute("SELECT count(*) AS n FROM api_tokens WHERE user_id=%s", (u["id"],)).fetchone()["n"] >= 5:
+            return render_page(c, u, "<p>You already have 5 sync tokens. Revoke one on the Account page first.</p>", status=400)
+        tok = "iris_" + secrets.token_urlsafe(30)
+        c.execute("INSERT INTO api_tokens(token_hash,user_id,label) VALUES(%s,%s,%s)", (_th(tok), u["id"], (f.get("label") or "")[:60]))
+        return render_page(c, u, "<h1 class=title style='font-size:26px'>Your sync token</h1><p>Shown once. Put it in the local app as <code>IRIS_SYNC_TOKEN</code>.</p>"
+            f"<p style='font:600 15px ui-monospace,monospace;word-break:break-all;padding:12px;border:1px dashed var(--border);border-radius:10px'>{tok}</p>"
+            f"<p><code>python3 iris/cli.py sync --server {esc(str(req.base_url).rstrip('/'))}/sync --notes-only</code></p><p><a href='/account'>Back to account</a></p>")
+
+@app.post("/account/token/revoke")
+async def account_token_revoke(req: Request):
+    f = await _form(req)
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        c.execute("DELETE FROM api_tokens WHERE user_id=%s AND token_hash=%s", (u["id"], f.get("h") or ""))
+    return RedirectResponse("/account", status_code=303)
+
+@app.post("/account/transcripts")
+async def account_transcripts(req: Request):
+    f = await _form(req); on = f.get("on") == "1"
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        c.execute("UPDATE users SET keep_transcripts=%s WHERE id=%s", (on, u["id"]))
+        if not on:
+            c.execute("UPDATE synced SET bundle = bundle - 'transcript' - 'transcript_age' WHERE user_id=%s", (u["id"],))
+    return RedirectResponse("/account", status_code=303)
 
 @app.get("/manifest.webmanifest")
 def manifest():
