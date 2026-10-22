@@ -399,10 +399,12 @@ async def api_segment(mid: str, req: Request, index: int = 0, offset: float = 0)
     with db() as c:
         u = current_user(c, req)
         if not u: return _err("not signed in", 401)
-        m = c.execute("SELECT status, seg_count FROM meetings WHERE id=%s AND user_id=%s", (mid, u["id"])).fetchone()
+        m = c.execute("SELECT status, seg_count, parts FROM meetings WHERE id=%s AND user_id=%s", (mid, u["id"])).fetchone()
         if not m: return _err("no such meeting", 404)
         if m["status"] not in ("recording", "error"): return _err("meeting already finished", 409)
         if m["seg_count"] >= MAX_SEGMENTS_PER_MEETING: return _err("meeting too long for hosted mode", 413)
+        # time labels come from the length of the audio already received, never from the browser's clock
+        offset = sum({p.get("index", 0): float(p.get("dur") or 300) for p in m["parts"] if p.get("index", 0) < index}.values())
     ctype = req.headers.get("content-type", "audio/webm")
     ext = "mp4" if "mp4" in ctype else "ogg" if "ogg" in ctype else "webm"
     async with httpx.AsyncClient(timeout=55) as h:
@@ -414,7 +416,7 @@ async def api_segment(mid: str, req: Request, index: int = 0, offset: float = 0)
     limits = {k: v for k, v in r.headers.items() if k.lower().startswith("x-ratelimit") or k.lower() == "retry-after"}
     segs = [{"start": float(s["start"]) + offset, "end": float(s["end"]) + offset, "text": s["text"].strip(), "lang": r.json().get("language")}
             for s in r.json().get("segments", []) if s.get("text", "").strip()]
-    part = {"index": index, "t0": offset, "t1": max([x["end"] for x in segs], default=offset)}
+    part = {"index": index, "t0": offset, "t1": max([x["end"] for x in segs], default=offset), "dur": float(r.json().get("duration") or 300)}
     if segs:
         try: part["notes"] = await _part_notes(segs, key)
         except Exception as e: part["error"] = str(e)[:140]
