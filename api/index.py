@@ -130,7 +130,7 @@ async def security_layer(req: Request, call_next):
     resp = await call_next(req)
     resp.headers["Content-Security-Policy"] = CSP
     resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Referrer-Policy"] = "same-origin"   # "no-referrer" makes browsers send Origin: null on our own forms, which the CSRF check refuses
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Permissions-Policy"] = "camera=(), geolocation=(), microphone=(self)"
     if "text/html" in resp.headers.get("content-type", "") or req.url.path.startswith(("/sync", "/api")):

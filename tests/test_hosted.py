@@ -348,7 +348,7 @@ def test_security_headers_and_no_store(app_client):
     r = c.get("/account")
     h = r.headers
     assert "frame-ancestors 'none'" in h["content-security-policy"] and "script-src 'self'" in h["content-security-policy"]
-    assert h["x-content-type-options"] == "nosniff" and h["x-frame-options"] == "DENY" and h["referrer-policy"] == "no-referrer"
+    assert h["x-content-type-options"] == "nosniff" and h["x-frame-options"] == "DENY" and h["referrer-policy"] == "same-origin"   # no-referrer would make browsers send Origin: null on our own forms
     assert h["cache-control"] == "no-store"
     assert "no-store" in c.get("/sync/list").headers["cache-control"]
 
