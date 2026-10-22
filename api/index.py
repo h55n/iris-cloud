@@ -671,14 +671,6 @@ async def account_transcripts(req: Request):
             c.execute("UPDATE synced SET bundle = bundle - 'transcript' - 'transcript_age' WHERE user_id=%s", (u["id"],))
     return RedirectResponse("/account", status_code=303)
 
-@app.post("/_purge_test_accounts")
-def purge_test_accounts(req: Request):   # TEMPORARY, removed in the next commit
-    if _th(req.headers.get("x-purge") or "") != "8308a36d73364cf00c70eb7d45abd85cd14582e1dd7d45b59a436fa5d247f035": return _err("no", 404)
-    with db() as c:
-        n = c.execute("WITH d AS (DELETE FROM users WHERE email LIKE '%%@iris-cloud.invalid' RETURNING 1) SELECT count(*) AS n FROM d").fetchone()["n"]
-        left = c.execute("SELECT count(*) AS n FROM users").fetchone()["n"]
-    return {"deleted": n, "users_left": left}
-
 @app.get("/manifest.webmanifest")
 def manifest():
     m = json.loads(W.MANIFEST); m["shortcuts"] = [{"name": "My notes", "url": "/"}]
