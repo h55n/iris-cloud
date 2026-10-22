@@ -536,7 +536,7 @@ TRANSCRIPT_KEYS = ("transcript", "transcript_age")
 AUDIO_KEYS = ("audio", "audio_b64", "audio_files_b64")
 
 def token_user(c, req: Request):
-    tok = req.headers.get("x-iris-token") or ""
+    tok = req.headers.get("x-iris-token") or req.headers.get("x-convo-token") or ""   # older Android builds send the legacy header
     if not tok: return None
     return c.execute("SELECT u.id, u.email, u.keep_transcripts FROM api_tokens t JOIN users u ON u.id=t.user_id WHERE t.token_hash=%s", (_th(tok),)).fetchone()
 
