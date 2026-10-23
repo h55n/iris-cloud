@@ -508,3 +508,61 @@ def test_cloud_graph_page_links_and_isolation(app_client):
     assert 'src="http' not in html and 'href="http' not in html   # fully self-contained
     assert b.get("/graph").text.count('"nodes": []') == 1          # other user sees nothing of mine
     assert app_client().get("/graph").status_code == 303           # logged out -> login
+
+
+CT = {"v": 1, "alg": "AES-GCM", "kdf": "PBKDF2-SHA256", "iter": 600000, "salt": "c2FsdA==", "iv": "aXZ2aXY=", "ct": "Y2lwaGVydGV4dA=="}
+
+def test_browser_encrypt_replaces_plaintext_and_blocks_plaintext_sync(app_client):
+    c = app_client(); signup(c)
+    H = {"X-Iris-Token": _token(c, app_client.mod)}
+    _push_note(c, H, "m-e", "Secret title", "# Secret title\n- private body words")
+    assert "private body words" in c.get("/n/m-e").text
+    r = c.post("/n/m-e/browser-encrypt", json={"notes_ct": CT, "title_ct": CT})
+    assert r.status_code == 200
+    with app_client.mod.db() as db:
+        b = db.execute("SELECT bundle FROM synced WHERE id='m-e'").fetchone()["bundle"]
+        assert "notes" not in b and "notes_ct" in b
+        assert "private body words" not in json.dumps(b) and "Secret title" not in json.dumps(b)
+        assert b["meta"]["browser_encrypted"] is True and b["meta"]["title"] == "Encrypted note"
+    page = c.get("/n/m-e").text
+    assert "private body words" not in page and "Secret title" not in page
+    assert "Unlock" in page and "passphrase" in page.lower()
+    # a device pushing plaintext over it is refused
+    r = c.post("/sync/push/m-e", json={"id": "m-e", "meta": {"title": "Secret title"}, "notes": "# x"}, headers=H)
+    assert r.status_code == 409
+    # bad envelopes refused; double-encrypt refused
+    assert c.post("/n/m-e/browser-encrypt", json={"notes_ct": {"v": 2}, "title_ct": CT}).status_code == 409
+    # edit stores ciphertext and bumps server_ts
+    r = c.post("/n/m-e/browser-update", json={"notes_ct": {**CT, "ct": "bmV3"}})
+    assert r.status_code == 200
+    # sync pull returns only ciphertext fields
+    got = c.get("/sync/pull/m-e", headers=H).json()
+    assert "notes_ct" in got and "notes" not in got
+
+
+def test_browser_encrypt_requires_transcript_ct_when_transcript_stored(app_client):
+    c = app_client(); signup(c)
+    H = {"X-Iris-Token": _token(c, app_client.mod)}
+    with app_client.mod.db() as db:
+        uid = db.execute("SELECT id FROM users ORDER BY id DESC LIMIT 1").fetchone()["id"]
+        db.execute("UPDATE users SET keep_transcripts=true WHERE id=%s", (uid,))
+    b = {"id": "m-t", "meta": {"title": "T", "created": 1.0}, "notes": "# T", "transcript": "[00:00] words"}
+    assert c.post("/sync/push/m-t", json=b, headers=H).status_code == 200
+    assert c.post("/n/m-t/browser-encrypt", json={"notes_ct": CT, "title_ct": CT}).status_code == 400
+    assert c.post("/n/m-t/browser-encrypt", json={"notes_ct": CT, "title_ct": CT, "transcript_ct": CT}).status_code == 200
+    with app_client.mod.db() as db:
+        assert "words" not in json.dumps(db.execute("SELECT bundle FROM synced WHERE id='m-t'").fetchone()["bundle"])
+
+
+def test_cloud_graph_hides_links_into_encrypted_notes(app_client):
+    c = app_client(); signup(c)
+    H = {"X-Iris-Token": _token(c, app_client.mod)}
+    _push_note(c, H, "m-p", "Plain", "# Plain\n- see [[Secret title]]")
+    _push_note(c, H, "m-q", "Secret title", "# Secret title\n- body")
+    c.post("/n/m-q/browser-encrypt", json={"notes_ct": CT, "title_ct": CT})
+    html = c.get("/graph").text
+    import json as J
+    data = J.loads(html.split("window.__graph=", 1)[1].split(";</script>", 1)[0].replace("<\\/", "</"))
+    assert data["edges"] == []                                   # no link drawn into the hidden note
+    titles = {n["title"] for n in data["nodes"]}
+    assert "Encrypted note" in titles and "Secret title" not in titles

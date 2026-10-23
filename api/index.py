@@ -684,6 +684,9 @@ async def sync_push(mid: str, req: Request):
         if not have and c.execute("SELECT count(*) AS n FROM synced WHERE user_id=%s", (u["id"],)).fetchone()["n"] >= MAX_SYNCED:
             return _err("synced meeting limit reached", 429)
         ts = time.time(); b["_server_ts"] = ts
+        old = c.execute("SELECT bundle FROM synced WHERE user_id=%s AND id=%s", (u["id"], mid)).fetchone()
+        if old and (old["bundle"].get("meta") or {}).get("browser_encrypted") and "notes_ct" not in b:
+            return _err("this note is browser-encrypted on the site; unlock and remove encryption there before syncing plaintext over it", 409)
         c.execute("INSERT INTO synced(user_id,id,bundle,server_ts) VALUES(%s,%s,%s,%s) ON CONFLICT (user_id,id) DO UPDATE SET bundle=EXCLUDED.bundle, server_ts=EXCLUDED.server_ts",
                   (u["id"], mid, json.dumps(b), ts))
         return {"ok": True, "id": mid, "transcript_dropped": dropped}
@@ -728,8 +731,11 @@ def graph_page(req: Request):
             nodes.append({"id": r["id"], "title": meta.get("title") or r["id"]})
             if "notes" not in b:   # notes_age ciphertext: node only, we cannot read links
                 continue
+            hidden = {r2["id"] for r2 in rows if (r2["bundle"].get("meta") or {}).get("browser_encrypted")}
             for target, _label in extract_links(b["notes"]):
                 to = lmap.get(_re.sub(r"\s+", " ", target.strip().lower()))
+                if to in hidden:   # do not draw links into a hidden note; the source note's own text still shows what the author wrote
+                    continue
                 if to and to != r["id"] and (r["id"], to) not in seen:
                     seen.add((r["id"], to)); edges.append({"from": r["id"], "to": to})
         g = {"nodes": nodes, "edges": edges}
@@ -741,6 +747,90 @@ def graph_page(req: Request):
                 '<script>window.__graph=' + json.dumps(g).replace("</", "<\\/") + ';</script>'
                 + GRAPH_JS.replace("/meeting/", "/n/"))
         return render_page(c, u, body)
+
+
+
+ENC_SETUP_JS = """<script>(function(){
+var root=document.getElementById('encsetup');if(!root)return;
+var b64s=function(a){return btoa(String.fromCharCode.apply(null,new Uint8Array(a)))};
+var te=new TextEncoder();
+function derive(pp,salt,iter){return crypto.subtle.importKey('raw',te.encode(pp),'PBKDF2',false,['deriveKey']).then(function(base){
+ return crypto.subtle.deriveKey({name:'PBKDF2',hash:'SHA-256',salt:salt,iterations:iter},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt'])})}
+function encText(k,salt,iter,plain){var iv=crypto.getRandomValues(new Uint8Array(12));
+ return crypto.subtle.encrypt({name:'AES-GCM',iv:iv},k,te.encode(plain)).then(function(b){
+  return {v:1,alg:'AES-GCM',kdf:'PBKDF2-SHA256',iter:iter,salt:b64s(salt),iv:b64s(iv),ct:b64s(b)}})}
+document.getElementById('encgo').addEventListener('click',function(){
+ var pp=document.getElementById('encnewpp').value,msg=document.getElementById('encmsg');
+ if(pp.length<8){msg.textContent='Use at least 8 characters.';return}
+ var notes='',ta=document.querySelector('textarea[name=notes]');
+ if(ta)notes=ta.value;
+ if(!notes){msg.textContent='Open Edit notes first so this tab has the text to encrypt.';return}
+ var title=(document.querySelector('h1.title')||{}).textContent||'Encrypted note';
+ var salt=crypto.getRandomValues(new Uint8Array(16)),iter=600000;
+ msg.textContent='Encrypting in this tab...';
+ derive(pp,salt,iter).then(function(k){
+  var jobs=[encText(k,salt,iter,notes),encText(k,salt,iter,title)];
+  if(root.dataset.tr)jobs.push(encText(k,salt,iter,root.dataset.tr));
+  return Promise.all(jobs)}).then(function(r){
+  var body={notes_ct:r[0],title_ct:r[1]};if(r[2])body.transcript_ct=r[2];
+  return fetch('/n/'+encodeURIComponent(root.dataset.mid)+'/browser-encrypt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})})
+ .then(function(resp){if(resp.ok){msg.textContent='Locked. Reloading...';location.reload()}
+  else resp.text().then(function(t){msg.textContent='Failed: '+t})})
+ .catch(function(e){msg.textContent='Failed: '+e.message})});
+})()</script>"""
+
+ENC_JS = """<script>(function(){
+var root=document.getElementById('enc');if(!root)return;
+var env=JSON.parse(root.dataset.env);
+var b64=function(s){return Uint8Array.from(atob(s),function(c){return c.charCodeAt(0)})};
+var b64s=function(a){return btoa(String.fromCharCode.apply(null,new Uint8Array(a)))};
+var te=new TextEncoder(),td=new TextDecoder();
+var key=null;
+function derive(pp,env){return crypto.subtle.importKey('raw',te.encode(pp),'PBKDF2',false,['deriveKey']).then(function(base){
+ return crypto.subtle.deriveKey({name:'PBKDF2',hash:'SHA-256',salt:b64(env.salt),iterations:env.iter},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt'])})}
+function dec(env,k){return crypto.subtle.decrypt({name:'AES-GCM',iv:b64(env.iv)},k,b64(env.ct)).then(function(b){return td.decode(b)})}
+function encText(k,env,plain){var iv=crypto.getRandomValues(new Uint8Array(12));
+ return crypto.subtle.encrypt({name:'AES-GCM',iv:iv},k,te.encode(plain)).then(function(b){
+  return {v:1,alg:'AES-GCM',kdf:'PBKDF2-SHA256',iter:env.iter,salt:env.salt,iv:b64s(iv),ct:b64s(b)}})}
+function esc(t){var d=document.createElement('div');d.textContent=t;return d.innerHTML}
+function inline(t){t=esc(t);
+ t=t.replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/~~([^~]+)~~/g,'<del>$1</del>');
+ return t}
+function renderMd(md,skipTitle){var out=[],first=true;
+ md.split('\n').forEach(function(line){
+  if(first&&line.trim()){first=false;if(skipTitle&&line.indexOf('# ')===0)return}
+  if(line.indexOf('## ')===0)out.push('<h2>'+inline(line.slice(3))+'</h2>');
+  else if(line.indexOf('# ')===0)out.push('<h2 class=big>'+inline(line.slice(2))+'</h2>');
+  else if(line.indexOf('### ')===0)out.push('<h3>'+inline(line.slice(4))+'</h3>');
+  else if(/^\s*- \[[xX]\] /.test(line))out.push('<div class="todo done"><span class="box on"></span><span>'+inline(line.split('] ')[1])+'</span></div>');
+  else if(/^\s*- \[ \] /.test(line))out.push('<div class=todo><span class=box></span><span>'+inline(line.split('] ')[1])+'</span></div>');
+  else if(/^\s*- /.test(line))out.push('<div class=bullet>'+inline(line.replace(/^\s*- /,''))+'</div>');
+  else if(line.trim())out.push('<p>'+inline(line)+'</p>')});
+ return out.join('\n')}
+document.getElementById('unlock').addEventListener('submit',function(e){e.preventDefault();
+ var pp=document.getElementById('pp').value,err=document.getElementById('encerr');err.textContent='';
+ derive(pp,env.notes_ct).then(function(k){
+  return dec(env.notes_ct,k).then(function(notes){
+   key=k;document.getElementById('plain').hidden=false;document.getElementById('unlock').style.display='none';
+   document.getElementById('encbody').innerHTML=renderMd(notes,true);
+   document.getElementById('encedit').value=notes;
+   var showTitle=function(t){document.getElementById('enctitle').textContent=t};
+   if(env.title_ct)dec(env.title_ct,k).then(showTitle,function(){});
+   if(env.transcript_ct){dec(env.transcript_ct,k).then(function(tr){
+    document.getElementById('encdrawer').hidden=false;
+    document.getElementById('enctr').textContent=tr},function(){})}
+  })}).catch(function(){err.textContent='Wrong passphrase, or this ciphertext is damaged.'})});
+document.getElementById('encsave').addEventListener('click',function(){
+ if(!key)return;var notes=document.getElementById('encedit').value,st=document.getElementById('encsaved');
+ var first=notes.split('\n').find(function(l){return l.trim()})||'';
+ var title=first.indexOf('# ')===0?first.slice(2).trim().slice(0,120):'Encrypted note';
+ Promise.all([encText(key,env.notes_ct,notes),encText(key,env.notes_ct,title)]).then(function(r){
+  fetch('/n/'+encodeURIComponent(env.mid)+'/browser-update',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({notes_ct:r[0],title_ct:r[1]})}).then(function(resp){
+   if(resp.ok){env.notes_ct=r[0];document.getElementById('encbody').innerHTML=renderMd(notes,true);
+    document.getElementById('enctitle').textContent=title;st.textContent='Saved. Only ciphertext left this tab.'}
+   else st.textContent='Save failed ('+resp.status+')'})})});
+})()</script>"""
 
 # ---------- synced notes (viewer and editor) ----------
 @app.get("/n/{mid}", response_class=HTMLResponse)
@@ -759,10 +849,37 @@ def synced_note(mid: str, req: Request):
                 m2 = lmap.get(_re.sub(r"\s+", " ", target.strip().lower()))
                 return (f"/n/{m2}", True) if m2 else ("#", False)
             body = render_notes_md(b["notes"], link_resolver=_resolve)
+            body += ('<details class=drawer style="margin-top:18px"><summary>Encrypt this note in the browser</summary>'
+                     '<div id=encsetup data-mid="' + esc(mid) + "' data-tr='" + esc(b.get("transcript") or "").replace("'", "&#39;") + "'>"
+                     '<p style="font-size:13.5px;color:var(--muted)">Locks the stored copy with a passphrase that never leaves this tab. '
+                     'Afterwards the site stores only ciphertext for the body, title and transcript. '
+                     'Still visible: that the note exists, when it was made, and the label "Encrypted note". '
+                     'Search and the graph stop reading it. <b>Lose the passphrase and the note cannot be recovered.</b></p>'
+                     '<input type=password id=encnewpp placeholder="New passphrase" autocomplete=off style="font:inherit;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);width:100%;max-width:340px"> '
+                     '<button id=encgo style="margin-top:8px;border:0;cursor:pointer;font:inherit;font-weight:600;padding:9px 18px;border-radius:999px;background:var(--accent);color:#fff">Encrypt the stored copy</button>'
+                     '<p id=encmsg style="font-size:13.5px;color:var(--muted)"></p></div></details>' + ENC_SETUP_JS)
             edit = (f'<details class=drawer><summary>Edit notes</summary><form method=post action="/n/{esc(mid)}/edit">'
                     f'<textarea name=notes rows=16 style="width:100%;font:13.5px/1.5 ui-monospace,monospace;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)">{esc(b["notes"])}</textarea>'
                     '<p><button style="border:0;cursor:pointer;font:inherit;font-weight:600;padding:9px 18px;border-radius:999px;background:var(--accent);color:#fff">Save</button> '
                     '<span style="color:var(--muted);font-size:13px">Your devices get the edit on their next sync.</span></p></form></details>')
+        elif "notes_ct" in b:
+            env = json.dumps({"mid": mid, "notes_ct": b["notes_ct"], "title_ct": b.get("title_ct"),
+                              "transcript_ct": b.get("transcript_ct"), "can_edit": True}).replace("</", "<\\/")
+            body = ('<div id=enc data-env=\'' + env.replace("'", "&#39;") + '\'>'
+                    '<p style="color:var(--muted)">This note is encrypted in your browser. The passphrase never leaves this tab; '
+                    'the site stores only ciphertext. Lose the passphrase and the note cannot be recovered.</p>'
+                    '<form id=unlock style="display:flex;gap:8px;max-width:420px;margin-top:10px">'
+                    '<input type=password id=pp required placeholder="Passphrase" autocomplete=off style="flex:1;font:inherit;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)">'
+                    '<button style="border:0;cursor:pointer;font:inherit;font-weight:600;padding:9px 18px;border-radius:999px;background:var(--accent);color:#fff">Unlock</button></form>'
+                    '<p id=encerr style="color:var(--danger,#b3261e);font-size:13.5px"></p>'
+                    '<div id=plain hidden><h1 class=title style="font-size:26px" id=enctitle></h1><div id=encbody></div>'
+                    '<details class=drawer id=encdrawer hidden><summary>Transcript</summary><div class=tr id=enctr></div></details>'
+                    '<details class=drawer><summary>Edit notes</summary>'
+                    '<textarea id=encedit rows=14 style="width:100%;font:13.5px/1.5 ui-monospace,monospace;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)"></textarea>'
+                    '<p><button id=encsave style="border:0;cursor:pointer;font:inherit;font-weight:600;padding:9px 18px;border-radius:999px;background:var(--accent);color:#fff">Save encrypted</button> '
+                    '<span id=encsaved style="color:var(--muted);font-size:13px"></span></p></details></div></div>'
+                    + ENC_JS)
+            edit = ""
         elif "notes_age" in b:
             body = ("<p style='color:var(--muted)'>These notes were encrypted on your device before syncing, so this site cannot read them. "
                     "Open them in the local Iris app or the Android app, which hold your key.</p>"); edit = ""
@@ -778,6 +895,56 @@ def synced_note(mid: str, req: Request):
                 + body + tr + edit
                 + f'<form method=post action="/n/{esc(mid)}/delete" style="margin-top:24px" data-confirm="Remove from the cloud? Your local copy stays."><button style="border:1px solid var(--border);background:transparent;color:#b3261e;cursor:pointer;font:inherit;font-size:13px;padding:6px 14px;border-radius:999px">Remove from cloud</button></form>')
         return render_page(c, u, page, active="n:" + mid)
+
+CT_KEYS = ("v", "alg", "kdf", "iter", "salt", "iv", "ct")
+def _valid_ct(d, max_len=400_000):
+    return (isinstance(d, dict) and d.get("v") == 1 and d.get("alg") == "AES-GCM"
+            and d.get("kdf") == "PBKDF2-SHA256" and 100_000 <= int(d.get("iter", 0)) <= 2_000_000
+            and all(isinstance(d.get(k), str) for k in ("salt", "iv", "ct")) and len(d.get("ct", "")) <= max_len)
+
+@app.post("/n/{mid}/browser-encrypt")
+async def browser_encrypt(mid: str, req: Request):
+    """Replace a synced note's plaintext with browser-made ciphertext. The passphrase
+    never leaves the user's tab; after this, the database holds only ciphertext for
+    body, title and transcript. Visible afterwards: that the note exists, its id,
+    timestamps and the placeholder 'Encrypted note'."""
+    body = await req.json()
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return _err("login", 401)
+        r = c.execute("SELECT bundle FROM synced WHERE user_id=%s AND id=%s", (u["id"], mid)).fetchone()
+        if not r: return _err("not found", 404)
+        b = r["bundle"]
+        if (b.get("meta") or {}).get("browser_encrypted"): return _err("already encrypted", 409)
+        if "notes" not in b: return _err("nothing readable to encrypt", 400)
+        if not _valid_ct(body.get("notes_ct")) or not _valid_ct(body.get("title_ct"), 4_000):
+            return _err("bad ciphertext envelope", 400)
+        if b.get("transcript") and not _valid_ct(body.get("transcript_ct")):
+            return _err("this note has a stored transcript; encrypt it too", 400)
+        meta = b.get("meta") or {}
+        meta["title"] = "Encrypted note"
+        meta["browser_encrypted"] = True
+        nb = {"meta": meta, "notes_ct": body["notes_ct"], "title_ct": body["title_ct"], "_server_ts": b.get("_server_ts", time.time())}
+        if b.get("transcript"): nb["transcript_ct"] = body["transcript_ct"]
+        c.execute("UPDATE synced SET bundle=%s WHERE user_id=%s AND id=%s", (json.dumps(nb), u["id"], mid))
+        return {"ok": True}
+
+@app.post("/n/{mid}/browser-update")
+async def browser_update(mid: str, req: Request):
+    """Store a new browser-made ciphertext for an already-encrypted note (edit flow)."""
+    body = await req.json()
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return _err("login", 401)
+        r = c.execute("SELECT bundle FROM synced WHERE user_id=%s AND id=%s", (u["id"], mid)).fetchone()
+        if not r or not (r["bundle"].get("meta") or {}).get("browser_encrypted"):
+            return _err("not found", 404)
+        if not _valid_ct(body.get("notes_ct")): return _err("bad ciphertext envelope", 400)
+        b = r["bundle"]; b["notes_ct"] = body["notes_ct"]
+        if _valid_ct(body.get("title_ct"), 4_000): b["title_ct"] = body["title_ct"]
+        c.execute("UPDATE synced SET bundle=%s, server_ts=%s WHERE user_id=%s AND id=%s",
+                  (json.dumps(b), time.time(), u["id"], mid))
+        return {"ok": True}
 
 @app.post("/n/{mid}/edit")
 async def synced_edit(mid: str, req: Request):
