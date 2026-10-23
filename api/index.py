@@ -200,7 +200,7 @@ def sidebar(c, user, active=None):
                 for t in ("", "blue", "purple", "orange", "pink", "red")) + '</div>'
             + '<script>function pickTheme(t,b){if(t)document.documentElement.dataset.theme=t;else delete document.documentElement.dataset.theme;'
               'try{localStorage.setItem("iris-theme",t)}catch(e){}document.querySelectorAll(".dot").forEach(function(d){d.classList.remove("sel")});b.classList.add("sel")}'
-              '(function(){var cur="";try{cur=localStorage.getItem("iris-theme")||""}catch(e){}var d=document.querySelector(\'.dot[data-t="\'+cur+\'"]\');if(d)d.classList.add("sel")})()'
+              '(function(){var cur="";try{cur=localStorage.getItem("iris-theme")||""}catch(e){}var d=document.querySelector(\'.dot[data-t="\'+cur+\'"]\');if(d)d.classList.add("sel")})();'
               'document.querySelectorAll(".dot").forEach(function(b){b.addEventListener("click",function(){pickTheme(b.dataset.t,b)})})</script>')
 
 DELEGATE_JS = ("<script>document.addEventListener('change',function(e){if(e.target.dataset&&e.target.dataset.autosubmit!==undefined)e.target.form.submit()});"
