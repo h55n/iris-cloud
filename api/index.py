@@ -797,7 +797,7 @@ function inline(t){t=esc(t);
  t=t.replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/~~([^~]+)~~/g,'<del>$1</del>');
  return t}
 function renderMd(md,skipTitle){var out=[],first=true;
- md.split('\n').forEach(function(line){
+ md.split('\\n').forEach(function(line){
   if(first&&line.trim()){first=false;if(skipTitle&&line.indexOf('# ')===0)return}
   if(line.indexOf('## ')===0)out.push('<h2>'+inline(line.slice(3))+'</h2>');
   else if(line.indexOf('# ')===0)out.push('<h2 class=big>'+inline(line.slice(2))+'</h2>');
@@ -806,7 +806,7 @@ function renderMd(md,skipTitle){var out=[],first=true;
   else if(/^\s*- \[ \] /.test(line))out.push('<div class=todo><span class=box></span><span>'+inline(line.split('] ')[1])+'</span></div>');
   else if(/^\s*- /.test(line))out.push('<div class=bullet>'+inline(line.replace(/^\s*- /,''))+'</div>');
   else if(line.trim())out.push('<p>'+inline(line)+'</p>')});
- return out.join('\n')}
+ return out.join('\\n')}
 document.getElementById('unlock').addEventListener('submit',function(e){e.preventDefault();
  var pp=document.getElementById('pp').value,err=document.getElementById('encerr');err.textContent='';
  derive(pp,env.notes_ct).then(function(k){
@@ -822,7 +822,7 @@ document.getElementById('unlock').addEventListener('submit',function(e){e.preven
   })}).catch(function(){err.textContent='Wrong passphrase, or this ciphertext is damaged.'})});
 document.getElementById('encsave').addEventListener('click',function(){
  if(!key)return;var notes=document.getElementById('encedit').value,st=document.getElementById('encsaved');
- var first=notes.split('\n').find(function(l){return l.trim()})||'';
+ var first=notes.split('\\n').find(function(l){return l.trim()})||'';
  var title=first.indexOf('# ')===0?first.slice(2).trim().slice(0,120):'Encrypted note';
  Promise.all([encText(key,env.notes_ct,notes),encText(key,env.notes_ct,title)]).then(function(r){
   fetch('/n/'+encodeURIComponent(env.mid)+'/browser-update',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -850,7 +850,7 @@ def synced_note(mid: str, req: Request):
                 return (f"/n/{m2}", True) if m2 else ("#", False)
             body = render_notes_md(b["notes"], link_resolver=_resolve)
             body += ('<details class=drawer style="margin-top:18px"><summary>Encrypt this note in the browser</summary>'
-                     '<div id=encsetup data-mid="' + esc(mid) + "' data-tr='" + esc(b.get("transcript") or "").replace("'", "&#39;") + "'>"
+                     '<div id=encsetup data-mid="' + esc(mid) + '" data-tr="' + esc(b.get("transcript") or "") + '">'
                      '<p style="font-size:13.5px;color:var(--muted)">Locks the stored copy with a passphrase that never leaves this tab. '
                      'Afterwards the site stores only ciphertext for the body, title and transcript. '
                      'Still visible: that the note exists, when it was made, and the label "Encrypted note". '
