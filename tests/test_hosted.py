@@ -648,10 +648,20 @@ def test_team_membership_flow(app_client):
     # logged-out visitor is asked to log in, no content
     r = app_client().get("/i/" + tok)
     assert "shared body text" not in r.text and "Log in" in r.text
-    # member accepts: consent screen names the note and the account shown to the owner
+    # consent screen discloses no title or content before access is granted
     r = member.get("/i/" + tok)
-    assert "Team note" in r.text and "Join the note" in r.text
+    assert "Team note" not in r.text and "shared body text" not in r.text and "Accept the invite" in r.text
     assert member.post("/i/" + tok + "/accept").status_code == 303
+    # accepted but not approved: no note, no comments, a waiting page instead
+    r = member.get("/n/m-t1")
+    assert "shared body text" not in r.text and "Waiting for approval" in r.text
+    assert member.post("/n/m-t1/comment", data={"body": "too early"}).status_code == 404
+    # owner sees the waiting account and approves it
+    team = owner.get("/n/m-t1/team").text
+    assert "waiting for your approval" in team
+    with app_client.mod.db() as db:
+        member_uid = db.execute("SELECT accepted_by FROM invites WHERE mid='m-t1' ORDER BY created DESC LIMIT 1").fetchone()["accepted_by"]
+    assert owner.post(f"/n/m-t1/member/{member_uid}/approve").status_code == 303
     # member can now read and comment; stranger still cannot
     assert "shared body text" in member.get("/n/m-t1").text
     assert stranger.get("/n/m-t1").status_code == 404
@@ -666,8 +676,6 @@ def test_team_membership_flow(app_client):
     # token is single-account: stranger cannot reuse it
     assert stranger.post("/i/" + tok + "/accept").status_code == 409
     # owner removes the member: access and comment form cut immediately
-    with app_client.mod.db() as db:
-        member_uid = db.execute("SELECT accepted_by FROM invites WHERE mid='m-t1' ORDER BY created DESC LIMIT 1").fetchone()["accepted_by"]
     assert owner.post(f"/n/m-t1/member/{member_uid}/remove").status_code == 303
     assert member.get("/n/m-t1").status_code == 404
     assert member.post("/n/m-t1/comment", data={"body": "still here?"}).status_code == 404
@@ -680,3 +688,70 @@ def test_team_invite_refused_on_encrypted_notes(app_client):
     c.post("/n/m-te/browser-encrypt", json={"notes_ct": CT, "title_ct": CT})
     assert c.post("/n/m-te/invite", data={"email": "a@b.c"}).status_code == 400
     assert "cannot have members" in c.get("/n/m-te/team").text
+
+
+def test_invite_expiry_revoke_race_and_encrypt_cutoff(app_client):
+    import re as RE
+    owner, m1, m2 = app_client(), app_client(), app_client()
+    signup(owner)
+    H = {"X-Iris-Token": _token(owner, app_client.mod)}
+    _push_note(owner, H, "m-t2", "Race note", "# Race note\n- secret sauce")
+    signup(m1); signup(m2)
+    owner.post("/n/m-t2/invite", data={"email": ""})
+    tok = RE.search(r"/i/([A-Za-z0-9_-]{16,})", owner.get("/n/m-t2/team").text).group(1)
+    # concurrent acceptance: first account binds the token, second is refused
+    assert m1.post("/i/" + tok + "/accept").status_code == 303
+    assert m2.post("/i/" + tok + "/accept").status_code == 409
+    assert "Waiting for approval" in m1.get("/n/m-t2").text
+    # expired invite is invalid
+    with app_client.mod.db() as db:
+        db.execute("UPDATE invites SET created=%s WHERE token=%s", (time.time() - 8 * 86400, tok))
+    assert m1.get("/i/" + tok).status_code == 404
+    # owner revokes a pending invite: link dies immediately
+    owner.post("/n/m-t2/invite", data={"email": ""})
+    tok2 = RE.findall(r"/i/([A-Za-z0-9_-]{16,})", owner.get("/n/m-t2/team").text)
+    tok2 = [t for t in tok2 if t != tok][0]
+    assert owner.post(f"/n/m-t2/invite/{tok2}/revoke").status_code == 303
+    assert m2.get("/i/" + tok2).status_code == 404
+    # approve m1 (fresh invite), then encrypt the note: membership access cuts off
+    owner.post("/n/m-t2/invite", data={"email": ""})
+    tok3 = [t for t in RE.findall(r"/i/([A-Za-z0-9_-]{16,})", owner.get("/n/m-t2/team").text) if t not in (tok, tok2)][0]
+    with app_client.mod.db() as db:
+        db.execute("UPDATE invites SET created=%s", (time.time(),))  # un-expire all for this step
+    m1.post("/i/" + tok3 + "/accept")
+    uid = None
+    with app_client.mod.db() as db:
+        uid = db.execute("SELECT accepted_by FROM invites WHERE token=%s", (tok3,)).fetchone()["accepted_by"]
+    owner.post(f"/n/m-t2/member/{uid}/approve")
+    assert "secret sauce" in m1.get("/n/m-t2").text
+    assert owner.post("/n/m-t2/browser-encrypt", json={"notes_ct": CT, "title_ct": CT}).status_code == 200
+    assert m1.get("/n/m-t2").status_code == 404                        # encrypted after membership: cutoff
+    assert m1.post("/n/m-t2/comment", data={"body": "x"}).status_code == 404
+    assert "secret sauce" not in m1.get("/i/" + tok3).text             # invite page leaks nothing either
+
+
+def test_team_page_is_owner_only_and_comments_stay_private(app_client):
+    import re as RE
+    owner, member, stranger = app_client(), app_client(), app_client()
+    signup(owner)
+    H = {"X-Iris-Token": _token(owner, app_client.mod)}
+    _push_note(owner, H, "m-t3", "Private note", "# Private note\n- hidden content")
+    signup(member); signup(stranger)
+    assert member.get("/n/m-t3/team").status_code == 404
+    assert stranger.get("/n/m-t3/team").status_code == 404
+    assert app_client().get("/n/m-t3/team").status_code == 303
+    owner.post("/n/m-t3/invite", data={"email": ""})
+    tok = RE.search(r"/i/([A-Za-z0-9_-]{16,})", owner.get("/n/m-t3/team").text).group(1)
+    member.post("/i/" + tok + "/accept")
+    with app_client.mod.db() as db:
+        uid = db.execute("SELECT accepted_by FROM invites WHERE token=%s", (tok,)).fetchone()["accepted_by"]
+    owner.post(f"/n/m-t3/member/{uid}/approve")
+    owner.post("/n/m-t3/comment", data={"body": "owner thought"})
+    member.post("/n/m-t3/comment", data={"body": "member thought"})
+    # comments render only inside the gated note page: stranger and logged-out see nothing anywhere
+    assert "owner thought" in member.get("/n/m-t3").text
+    assert "member thought" in owner.get("/n/m-t3").text
+    assert stranger.get("/n/m-t3").status_code == 404
+    assert "owner thought" not in stranger.get("/").text
+    # team page of a note the member is on: still owner-only
+    assert member.get("/n/m-t3/team").status_code == 404

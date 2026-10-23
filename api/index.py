@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS meetings(id text PRIMARY KEY, user_id bigint REFERENC
 ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_hash text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS keep_transcripts boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS api_tokens(token_hash text PRIMARY KEY, user_id bigint REFERENCES users(id) ON DELETE CASCADE, label text NOT NULL DEFAULT '', created timestamptz DEFAULT now());
+ALTER TABLE IF EXISTS invites ADD COLUMN IF NOT EXISTS approved boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS invites(token text PRIMARY KEY, owner_id bigint REFERENCES users(id) ON DELETE CASCADE, mid text NOT NULL, email_text text NOT NULL DEFAULT '', created double precision NOT NULL, accepted_by bigint REFERENCES users(id) ON DELETE CASCADE, revoked boolean NOT NULL DEFAULT false);
 CREATE TABLE IF NOT EXISTS note_comments(id bigserial PRIMARY KEY, owner_id bigint REFERENCES users(id) ON DELETE CASCADE, mid text NOT NULL, author_id bigint REFERENCES users(id) ON DELETE CASCADE, body text NOT NULL, created double precision NOT NULL);
 CREATE TABLE IF NOT EXISTS shares(token text PRIMARY KEY, user_id bigint REFERENCES users(id) ON DELETE CASCADE, mid text NOT NULL, created double precision NOT NULL);
@@ -189,7 +190,7 @@ def sidebar(c, user, active=None):
             except Exception: when = "synced"
             items += (f'<a class="nav-item{" active" if "n:" + m["id"] == active else ""}" href="/n/{esc(m["id"])}">'
                       f'<div class=nav-title>{esc(m["title"] or m["id"])}</div><div class=nav-meta>{when} &middot; synced</div></a>')
-    shared_rows = c.execute("SELECT i.mid, y.bundle->'meta'->>'title' AS title FROM invites i JOIN synced y ON y.user_id=i.owner_id AND y.id=i.mid WHERE i.accepted_by=%s AND NOT i.revoked ORDER BY i.created DESC LIMIT 20", (user["id"],)).fetchall() if user else []
+    shared_rows = c.execute("SELECT i.mid, y.bundle->'meta'->>'title' AS title FROM invites i JOIN synced y ON y.user_id=i.owner_id AND y.id=i.mid WHERE i.accepted_by=%s AND i.approved AND NOT i.revoked ORDER BY i.created DESC LIMIT 20", (user["id"],)).fetchall() if user else []
     if shared_rows:
         items += "<div class=nav-sec style='margin-top:10px'>Shared with you</div>"
         for m in shared_rows:
@@ -881,15 +882,20 @@ def recap_page(req: Request):
         return render_page(c, u, body)
 
 # ---------- team participation: owner-controlled membership + comments ----------
+INVITE_TTL = 7 * 86400
 def _is_member(c, owner_id, mid, user_id):
-    return c.execute("SELECT 1 FROM invites WHERE owner_id=%s AND mid=%s AND accepted_by=%s AND NOT revoked",
+    return c.execute("SELECT 1 FROM invites WHERE owner_id=%s AND mid=%s AND accepted_by=%s AND approved AND NOT revoked",
                      (owner_id, mid, user_id)).fetchone() is not None
 
 def _note_for_user(c, mid, u):
-    """(owner_id, bundle) if u owns the note or is an accepted member, else None."""
-    r = c.execute("SELECT user_id, bundle FROM synced WHERE id=%s AND (user_id=%s OR user_id IN (SELECT owner_id FROM invites WHERE mid=%s AND accepted_by=%s AND NOT revoked))",
-                  (mid, u["id"], mid, u["id"])).fetchone()
-    return (r["user_id"], r["bundle"]) if r else None
+    """(owner_id, bundle) if u owns the note, or is an approved member of a still-plaintext note, else None.
+    Browser-encrypted notes have no members: encrypting after membership cuts members off."""
+    own = c.execute("SELECT user_id, bundle FROM synced WHERE id=%s AND user_id=%s", (mid, u["id"])).fetchone()
+    if own: return own["user_id"], own["bundle"]
+    r = c.execute("SELECT user_id, bundle FROM synced WHERE id=%s AND user_id IN (SELECT owner_id FROM invites WHERE mid=%s AND accepted_by=%s AND approved AND NOT revoked)",
+                  (mid, mid, u["id"])).fetchone()
+    if r and "notes" in r["bundle"]: return r["user_id"], r["bundle"]
+    return None
 
 def comments_html(c, owner_id, mid, u):
     rows = c.execute("SELECT m.body, m.created, m.author_id, users.email FROM note_comments m JOIN users ON users.id=m.author_id WHERE m.owner_id=%s AND m.mid=%s ORDER BY m.created LIMIT 200",
@@ -944,6 +950,22 @@ async def note_invite(mid: str, req: Request):
                   (token, u["id"], mid, email_text, time.time()))
         return RedirectResponse(f"/n/{mid}/team", status_code=303)
 
+@app.post("/n/{mid}/member/{uid}/approve")
+def member_approve(mid: str, uid: int, req: Request):
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        c.execute("UPDATE invites SET approved=true WHERE owner_id=%s AND mid=%s AND accepted_by=%s AND NOT revoked", (u["id"], mid, uid))
+        return RedirectResponse(f"/n/{mid}/team", status_code=303)
+
+@app.post("/n/{mid}/invite/{token}/revoke")
+def invite_revoke(mid: str, token: str, req: Request):
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        c.execute("UPDATE invites SET revoked=true WHERE owner_id=%s AND mid=%s AND token=%s", (u["id"], mid, token))
+        return RedirectResponse(f"/n/{mid}/team", status_code=303)
+
 @app.post("/n/{mid}/member/{uid}/remove")
 def member_remove(mid: str, uid: int, req: Request):
     with db() as c:
@@ -961,24 +983,39 @@ def team_page(mid: str, req: Request):
         if not r: return render_page(c, u, "<p>Not found.</p>", status=404)
         if "notes" not in r["bundle"]:
             return render_page(c, u, "<p>This note is encrypted - the site cannot read it, so it cannot have members.</p>")
-        invites = c.execute("SELECT token, email_text, created, accepted_by FROM invites WHERE owner_id=%s AND mid=%s AND NOT revoked ORDER BY created DESC",
+        invites = c.execute("SELECT token, email_text, created, accepted_by, approved FROM invites WHERE owner_id=%s AND mid=%s AND NOT revoked ORDER BY created DESC",
                             (u["id"], mid)).fetchall()
         body = (f'<h1 class=title style="font-size:26px">People on this note</h1>'
                 f'<p style="color:var(--muted);font-size:13.5px">Invite someone by typing their email for your own labeling - '
-                f'then send them the invite link yourself, through any channel you trust. The link is what grants access: '
-                f'whoever accepts it while signed in becomes a member. Their typed email is never checked. '
+                f'then send them the invite link yourself, through any channel you trust. '
+                f'Whoever accepts the link while signed in asks to join: you approve their specific account before they see anything. '
+                f'Their typed email is never checked - approve only accounts you recognize. '
                 f'Members can read this note and comment. Removing a member cuts access immediately.</p>'
                 f'<form method=post action="/n/{esc(mid)}/invite" style="display:flex;gap:8px;max-width:460px">'
                 f'<input name=email type=text placeholder="Their email (label only)" style="flex:1;font:inherit;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)">'
                 f'<button style="border:0;cursor:pointer;font:inherit;font-weight:600;padding:9px 18px;border-radius:999px;background:var(--accent);color:#fff">Create invite</button></form>')
+        invites = [i for i in invites if time.time() - i["created"] <= INVITE_TTL]
         pend = [i for i in invites if not i["accepted_by"]]
-        membs = [i for i in invites if i["accepted_by"]]
+        waiting = [i for i in invites if i["accepted_by"] and not i["approved"]]
+        membs = [i for i in invites if i["accepted_by"] and i["approved"]]
         if pend:
             body += "<h2 style='font-size:17px;margin-top:22px'>Invites to send</h2>"
             for i in pend:
                 url = str(req.base_url).rstrip("/") + "/i/" + i["token"]
                 label = f' for {esc(i["email_text"])}' if i["email_text"] else ""
-                body += (f'<div style="margin:8px 0;font-size:13.5px">Invite{label}: <a class=wikilink href="{url}">{esc(url)}</a></div>')
+                body += (f'<div style="margin:8px 0;font-size:13.5px;display:flex;justify-content:space-between;max-width:560px;gap:10px"><span>Invite{label}: <a class=wikilink href="{url}">{esc(url)}</a></span>'
+                         f'<form method=post action="/n/{esc(mid)}/invite/{i["token"]}/revoke" data-confirm="Revoke this invite? The link stops working immediately.">'
+                         f'<button style="border:1px solid var(--border);background:transparent;color:#b3261e;cursor:pointer;font:inherit;font-size:12.5px;padding:4px 12px;border-radius:999px">Revoke</button></form></div>')
+        if waiting:
+            body += "<h2 style='font-size:17px;margin-top:22px'>Accepted - waiting for your approval</h2>"
+            for i in waiting:
+                em = c.execute("SELECT email FROM users WHERE id=%s", (i["accepted_by"],)).fetchone()["email"]
+                label = f' (invited as {esc(i["email_text"])})' if i["email_text"] else ""
+                body += (f'<div style="margin:8px 0;font-size:13.5px;display:flex;justify-content:space-between;max-width:560px;gap:10px"><span>{esc(em)}{label} cannot see the note yet</span>'
+                         f'<span style="display:flex;gap:6px"><form method=post action="/n/{esc(mid)}/member/{i["accepted_by"]}/approve">'
+                         f'<button style="border:0;cursor:pointer;font:inherit;font-size:12.5px;font-weight:600;padding:4px 12px;border-radius:999px;background:var(--accent);color:#fff">Approve</button></form>'
+                         f'<form method=post action="/n/{esc(mid)}/member/{i["accepted_by"]}/remove" data-confirm="Decline and remove this account?">'
+                         f'<button style="border:1px solid var(--border);background:transparent;color:#b3261e;cursor:pointer;font:inherit;font-size:12.5px;padding:4px 12px;border-radius:999px">Decline</button></form></span></div>')
         if membs:
             body += "<h2 style='font-size:17px;margin-top:22px'>Members</h2>"
             for i in membs:
@@ -995,19 +1032,27 @@ def invite_page(token: str, req: Request):
     with db() as c:
         u = current_user(c, req)
         i = c.execute("SELECT * FROM invites WHERE token=%s AND NOT revoked", (token,)).fetchone()
-        if not i: return render_page(c, u, "<p>This invite link is not valid anymore.</p>", status=404)
-        title = (c.execute("SELECT bundle->'meta'->>'title' AS t FROM synced WHERE user_id=%s AND id=%s", (i["owner_id"], i["mid"])).fetchone() or {}).get("t") or i["mid"]
+        if not i or time.time() - i["created"] > INVITE_TTL:
+            return render_page(c, u, "<p>This invite link is not valid anymore.</p>", status=404)
         if not u:
-            return render_page(c, None, f"<p>You were invited to read and comment on <b>{esc(title)}</b>. <a class=wikilink href='/login'>Log in</a> or <a class=wikilink href='/signup'>sign up</a> first, then open this link again.</p>")
+            return render_page(c, None, "<p>You were invited to a shared note on Iris. "
+                                        "<a class=wikilink href='/login'>Log in</a> or <a class=wikilink href='/signup'>sign up</a> first, then open this link again.</p>")
         if i["owner_id"] == u["id"]:
             return render_page(c, u, "<p>This is your own invite link - send it to the person you want to add.</p>")
         if i["accepted_by"] and i["accepted_by"] != u["id"]:
             return render_page(c, u, "<p>This invite was already used by another account.</p>")
-        return render_page(c, u, (f"<h1 class=title style='font-size:24px'>Join this note?</h1>"
-                                  f"<p>You will be able to read and comment on <b>{esc(title)}</b>. "
-                                  f"The note owner will see your account email ({esc(u['email'])}). The owner can remove you anytime.</p>"
+        if i["accepted_by"] == u["id"] and not i["approved"]:
+            return render_page(c, u, "<h1 class=title style='font-size:24px'>Waiting for approval</h1>"
+                                     "<p>You have accepted this invite. The note owner still has to approve your account "
+                                     "before you can see the note or its comments.</p>")
+        if i["accepted_by"] == u["id"] and i["approved"]:
+            return RedirectResponse(f"/n/{i['mid']}", status_code=303)
+        return render_page(c, u, ("<h1 class=title style='font-size:24px'>Accept this invite?</h1>"
+                                  "<p>Someone shared a note with you on Iris. After you accept, the owner approves your account "
+                                  "before you can read or comment. The owner will see your account email "
+                                  f"({esc(u['email'])}) and can remove you anytime. The note's contents stay hidden until approval.</p>"
                                   f"<form method=post action='/i/{esc(token)}/accept'>"
-                                  f"<button style='border:0;cursor:pointer;font:inherit;font-weight:600;padding:9px 18px;border-radius:999px;background:var(--accent);color:#fff'>Join the note</button></form>"))
+                                  f"<button style='border:0;cursor:pointer;font:inherit;font-weight:600;padding:9px 18px;border-radius:999px;background:var(--accent);color:#fff'>Accept the invite</button></form>"))
 
 @app.post("/i/{token}/accept")
 def invite_accept(token: str, req: Request):
@@ -1019,8 +1064,8 @@ def invite_accept(token: str, req: Request):
         if i["accepted_by"] and i["accepted_by"] != u["id"]:
             return _err("this invite was already used by another account", 409)
         if not i["accepted_by"]:
-            c.execute("UPDATE invites SET accepted_by=%s WHERE token=%s", (u["id"], token))
-        return RedirectResponse(f"/n/{i['mid']}", status_code=303)
+            c.execute("UPDATE invites SET accepted_by=%s WHERE token=%s AND accepted_by IS NULL", (u["id"], token))
+        return RedirectResponse(f"/i/{token}", status_code=303)
 
 # ---------- public share links (explicit per-note opt-in) ----------
 def _share_url(req, token):
@@ -1096,7 +1141,12 @@ def synced_note(mid: str, req: Request):
         u = current_user(c, req)
         if not u: return RedirectResponse("/login", status_code=303)
         found = _note_for_user(c, mid, u)
-        if not found: return render_page(c, u, "<p>Not found.</p>", status=404)
+        if not found:
+            pending = c.execute("SELECT 1 FROM invites WHERE mid=%s AND accepted_by=%s AND NOT approved AND NOT revoked", (mid, u["id"])).fetchone()
+            if pending:
+                return render_page(c, u, "<h1 class=title style='font-size:24px'>Waiting for approval</h1>"
+                                         "<p>The note owner has not approved your account yet. The note and its comments stay hidden until then.</p>")
+            return render_page(c, u, "<p>Not found.</p>", status=404)
         owner_id, b = found
         is_owner = owner_id == u["id"]
         meta = b.get("meta") or {}
