@@ -866,8 +866,8 @@ def recap_page(req: Request):
             body += "<h2>Action items</h2>"
             for a in rep["actions"]:
                 cls, box = ("todo done", "box on") if a["done"] else ("todo", "box")
-                body += (f'<div class="{cls}"><span class="{box}"></span><span>{esc(a["text"])}'
-                         f' <span style="color:var(--muted);font-size:12.5px">- {esc(a["source"])}</span></span></div>')
+                body += (f'<div class="{cls}"><span class="{box}"></span><span>{esc(a["text"])}</span>'
+                         f' <span style="color:var(--muted);font-size:12.5px">- {esc(a["source"])}</span></div>')
         if rep["link_count"]:
             body += f'<p style="color:var(--muted);font-size:13px">{rep["link_count"]} [[link]]{"s" if rep["link_count"] != 1 else ""} written this week. <a class=wikilink href="/graph">Open the graph</a></p>'
         return render_page(c, u, body)
