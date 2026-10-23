@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS meetings(id text PRIMARY KEY, user_id bigint REFERENC
 ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_hash text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS keep_transcripts boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS api_tokens(token_hash text PRIMARY KEY, user_id bigint REFERENCES users(id) ON DELETE CASCADE, label text NOT NULL DEFAULT '', created timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS invites(token text PRIMARY KEY, owner_id bigint REFERENCES users(id) ON DELETE CASCADE, mid text NOT NULL, email_text text NOT NULL DEFAULT '', created double precision NOT NULL, accepted_by bigint REFERENCES users(id) ON DELETE CASCADE, revoked boolean NOT NULL DEFAULT false);
+CREATE TABLE IF NOT EXISTS note_comments(id bigserial PRIMARY KEY, owner_id bigint REFERENCES users(id) ON DELETE CASCADE, mid text NOT NULL, author_id bigint REFERENCES users(id) ON DELETE CASCADE, body text NOT NULL, created double precision NOT NULL);
 CREATE TABLE IF NOT EXISTS shares(token text PRIMARY KEY, user_id bigint REFERENCES users(id) ON DELETE CASCADE, mid text NOT NULL, created double precision NOT NULL);
 CREATE TABLE IF NOT EXISTS synced(user_id bigint REFERENCES users(id) ON DELETE CASCADE, id text NOT NULL, bundle jsonb NOT NULL, server_ts double precision NOT NULL, PRIMARY KEY(user_id,id));
 ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS expires timestamptz NOT NULL DEFAULT now() + interval '90 days';
@@ -187,6 +189,12 @@ def sidebar(c, user, active=None):
             except Exception: when = "synced"
             items += (f'<a class="nav-item{" active" if "n:" + m["id"] == active else ""}" href="/n/{esc(m["id"])}">'
                       f'<div class=nav-title>{esc(m["title"] or m["id"])}</div><div class=nav-meta>{when} &middot; synced</div></a>')
+    shared_rows = c.execute("SELECT i.mid, y.bundle->'meta'->>'title' AS title FROM invites i JOIN synced y ON y.user_id=i.owner_id AND y.id=i.mid WHERE i.accepted_by=%s AND NOT i.revoked ORDER BY i.created DESC LIMIT 20", (user["id"],)).fetchall() if user else []
+    if shared_rows:
+        items += "<div class=nav-sec style='margin-top:10px'>Shared with you</div>"
+        for m in shared_rows:
+            items += (f'<a class="nav-item{" active" if "n:" + m["mid"] == active else ""}" href="/n/{esc(m["mid"])}">'
+                      f'<div class=nav-title>{esc(m["title"] or m["mid"])}</div><div class=nav-meta>shared</div></a>')
     who = (f'<div class=nav-sec>Signed in</div><div class=nav-meta style="padding:2px 12px 8px">{esc(user["email"])}</div>'
            '<a class=wl href="/account">Account</a><form method=post action="/logout" style="margin:0"><button class=wl>Log out</button></form>'
            '<style>.wl{display:block;width:100%;text-align:left;padding:6px 12px;border:0;background:transparent;color:var(--text);font:inherit;font-size:14px;text-decoration:none;border-radius:6px;cursor:pointer}.wl:hover{background:var(--active-bg)}'
@@ -872,6 +880,148 @@ def recap_page(req: Request):
             body += f'<p style="color:var(--muted);font-size:13px">{rep["link_count"]} [[link]]{"s" if rep["link_count"] != 1 else ""} written this week. <a class=wikilink href="/graph">Open the graph</a></p>'
         return render_page(c, u, body)
 
+# ---------- team participation: owner-controlled membership + comments ----------
+def _is_member(c, owner_id, mid, user_id):
+    return c.execute("SELECT 1 FROM invites WHERE owner_id=%s AND mid=%s AND accepted_by=%s AND NOT revoked",
+                     (owner_id, mid, user_id)).fetchone() is not None
+
+def _note_for_user(c, mid, u):
+    """(owner_id, bundle) if u owns the note or is an accepted member, else None."""
+    r = c.execute("SELECT user_id, bundle FROM synced WHERE id=%s AND (user_id=%s OR user_id IN (SELECT owner_id FROM invites WHERE mid=%s AND accepted_by=%s AND NOT revoked))",
+                  (mid, u["id"], mid, u["id"])).fetchone()
+    return (r["user_id"], r["bundle"]) if r else None
+
+def comments_html(c, owner_id, mid, u):
+    rows = c.execute("SELECT m.body, m.created, m.author_id, users.email FROM note_comments m JOIN users ON users.id=m.author_id WHERE m.owner_id=%s AND m.mid=%s ORDER BY m.created LIMIT 200",
+                     (owner_id, mid)).fetchall()
+    if not rows:
+        return ""
+    out = ['<details class=drawer style="margin-top:18px" open><summary>Comments (' + str(len(rows)) + ')</summary>']
+    for r in rows:
+        when = time.strftime("%b %-d %H:%M UTC", time.gmtime(r["created"]))
+        mine = " (you)" if r["author_id"] == u["id"] else ""
+        out.append(f'<div style="margin:10px 0"><div style="font-size:12.5px;color:var(--muted)">{esc(r["email"])}{mine} &middot; {when}</div>'
+                   f'<div style="font-size:14px">{esc(r["body"])}</div></div>')
+    out.append('</details>')
+    return "".join(out)
+
+def comment_form(mid, member):
+    who = "Only the owner and invited members can comment." if member else ""
+    return (f'<details class=drawer style="margin-top:18px"><summary>Add a comment</summary>'
+            f'<form method=post action="/n/{esc(mid)}/comment">'
+            f'<textarea name=body rows=3 maxlength=2000 required style="width:100%;font:inherit;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)"></textarea>'
+            f'<p><button style="border:0;cursor:pointer;font:inherit;font-weight:600;padding:8px 16px;border-radius:999px;background:var(--accent);color:#fff">Comment</button> '
+            f'<span style="color:var(--muted);font-size:12.5px">{who} Comments are visible to the note owner and all members.</span></p></form></details>')
+
+@app.post("/n/{mid}/comment")
+async def note_comment(mid: str, req: Request):
+    f = await _form(req); body = (f.get("body") or "").strip()[:2000]
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        found = _note_for_user(c, mid, u)
+        if not found: return _err("not found", 404)
+        owner_id, b = found
+        if "notes" not in b: return _err("encrypted notes cannot be commented on - the site cannot read them", 400)
+        if not body: return RedirectResponse(f"/n/{mid}", status_code=303)
+        c.execute("INSERT INTO note_comments(owner_id,mid,author_id,body,created) VALUES(%s,%s,%s,%s,%s)",
+                  (owner_id, mid, u["id"], body, time.time()))
+        return RedirectResponse(f"/n/{mid}", status_code=303)
+
+@app.post("/n/{mid}/invite")
+async def note_invite(mid: str, req: Request):
+    import secrets
+    f = await _form(req); email_text = (f.get("email") or "").strip()[:200]
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        r = c.execute("SELECT bundle FROM synced WHERE user_id=%s AND id=%s", (u["id"], mid)).fetchone()
+        if not r: return _err("not found", 404)
+        if "notes" not in r["bundle"]:
+            return _err("this note is encrypted - the site cannot read it, so it cannot be shared with members", 400)
+        token = secrets.token_urlsafe(16)
+        c.execute("INSERT INTO invites(token,owner_id,mid,email_text,created) VALUES(%s,%s,%s,%s,%s)",
+                  (token, u["id"], mid, email_text, time.time()))
+        return RedirectResponse(f"/n/{mid}/team", status_code=303)
+
+@app.post("/n/{mid}/member/{uid}/remove")
+def member_remove(mid: str, uid: int, req: Request):
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        c.execute("UPDATE invites SET revoked=true WHERE owner_id=%s AND mid=%s AND accepted_by=%s", (u["id"], mid, uid))
+        return RedirectResponse(f"/n/{mid}/team", status_code=303)
+
+@app.get("/n/{mid}/team", response_class=HTMLResponse)
+def team_page(mid: str, req: Request):
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        r = c.execute("SELECT bundle FROM synced WHERE user_id=%s AND id=%s", (u["id"], mid)).fetchone()
+        if not r: return render_page(c, u, "<p>Not found.</p>", status=404)
+        if "notes" not in r["bundle"]:
+            return render_page(c, u, "<p>This note is encrypted - the site cannot read it, so it cannot have members.</p>")
+        invites = c.execute("SELECT token, email_text, created, accepted_by FROM invites WHERE owner_id=%s AND mid=%s AND NOT revoked ORDER BY created DESC",
+                            (u["id"], mid)).fetchall()
+        body = (f'<h1 class=title style="font-size:26px">People on this note</h1>'
+                f'<p style="color:var(--muted);font-size:13.5px">Invite someone by typing their email for your own labeling - '
+                f'then send them the invite link yourself, through any channel you trust. The link is what grants access: '
+                f'whoever accepts it while signed in becomes a member. Their typed email is never checked. '
+                f'Members can read this note and comment. Removing a member cuts access immediately.</p>'
+                f'<form method=post action="/n/{esc(mid)}/invite" style="display:flex;gap:8px;max-width:460px">'
+                f'<input name=email type=text placeholder="Their email (label only)" style="flex:1;font:inherit;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)">'
+                f'<button style="border:0;cursor:pointer;font:inherit;font-weight:600;padding:9px 18px;border-radius:999px;background:var(--accent);color:#fff">Create invite</button></form>')
+        pend = [i for i in invites if not i["accepted_by"]]
+        membs = [i for i in invites if i["accepted_by"]]
+        if pend:
+            body += "<h2 style='font-size:17px;margin-top:22px'>Invites to send</h2>"
+            for i in pend:
+                url = str(req.base_url).rstrip("/") + "/i/" + i["token"]
+                label = f' for {esc(i["email_text"])}' if i["email_text"] else ""
+                body += (f'<div style="margin:8px 0;font-size:13.5px">Invite{label}: <a class=wikilink href="{url}">{esc(url)}</a></div>')
+        if membs:
+            body += "<h2 style='font-size:17px;margin-top:22px'>Members</h2>"
+            for i in membs:
+                em = c.execute("SELECT email FROM users WHERE id=%s", (i["accepted_by"],)).fetchone()["email"]
+                label = f' (invited as {esc(i["email_text"])})' if i["email_text"] else ""
+                body += (f'<div style="margin:8px 0;font-size:13.5px;display:flex;justify-content:space-between;max-width:460px"><span>{esc(em)}{label}</span>'
+                         f'<form method=post action="/n/{esc(mid)}/member/{i["accepted_by"]}/remove" data-confirm="Remove this member? They lose access immediately.">'
+                         f'<button style="border:1px solid var(--border);background:transparent;color:#b3261e;cursor:pointer;font:inherit;font-size:12.5px;padding:4px 12px;border-radius:999px">Remove</button></form></div>')
+        body += f'<p style="margin-top:20px"><a class=back href="/n/{esc(mid)}">&larr; Back to the note</a></p>'
+        return render_page(c, u, body)
+
+@app.get("/i/{token}", response_class=HTMLResponse)
+def invite_page(token: str, req: Request):
+    with db() as c:
+        u = current_user(c, req)
+        i = c.execute("SELECT * FROM invites WHERE token=%s AND NOT revoked", (token,)).fetchone()
+        if not i: return render_page(c, u, "<p>This invite link is not valid anymore.</p>", status=404)
+        title = (c.execute("SELECT bundle->'meta'->>'title' AS t FROM synced WHERE user_id=%s AND id=%s", (i["owner_id"], i["mid"])).fetchone() or {}).get("t") or i["mid"]
+        if not u:
+            return render_page(c, None, f"<p>You were invited to read and comment on <b>{esc(title)}</b>. <a class=wikilink href='/login'>Log in</a> or <a class=wikilink href='/signup'>sign up</a> first, then open this link again.</p>")
+        if i["owner_id"] == u["id"]:
+            return render_page(c, u, "<p>This is your own invite link - send it to the person you want to add.</p>")
+        if i["accepted_by"] and i["accepted_by"] != u["id"]:
+            return render_page(c, u, "<p>This invite was already used by another account.</p>")
+        return render_page(c, u, (f"<h1 class=title style='font-size:24px'>Join this note?</h1>"
+                                  f"<p>You will be able to read and comment on <b>{esc(title)}</b>. "
+                                  f"The note owner will see your account email ({esc(u['email'])}). The owner can remove you anytime.</p>"
+                                  f"<form method=post action='/i/{esc(token)}/accept'>"
+                                  f"<button style='border:0;cursor:pointer;font:inherit;font-weight:600;padding:9px 18px;border-radius:999px;background:var(--accent);color:#fff'>Join the note</button></form>"))
+
+@app.post("/i/{token}/accept")
+def invite_accept(token: str, req: Request):
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        i = c.execute("SELECT * FROM invites WHERE token=%s AND NOT revoked", (token,)).fetchone()
+        if not i or i["owner_id"] == u["id"]: return _err("not found", 404)
+        if i["accepted_by"] and i["accepted_by"] != u["id"]:
+            return _err("this invite was already used by another account", 409)
+        if not i["accepted_by"]:
+            c.execute("UPDATE invites SET accepted_by=%s WHERE token=%s", (u["id"], token))
+        return RedirectResponse(f"/n/{i['mid']}", status_code=303)
+
 # ---------- public share links (explicit per-note opt-in) ----------
 def _share_url(req, token):
     return str(req.base_url).rstrip("/") + "/s/" + token
@@ -945,26 +1095,29 @@ def synced_note(mid: str, req: Request):
     with db() as c:
         u = current_user(c, req)
         if not u: return RedirectResponse("/login", status_code=303)
-        r = c.execute("SELECT bundle FROM synced WHERE user_id=%s AND id=%s", (u["id"], mid)).fetchone()
-        if not r: return render_page(c, u, "<p>Not found.</p>", status=404)
-        b = r["bundle"]; meta = b.get("meta") or {}
+        found = _note_for_user(c, mid, u)
+        if not found: return render_page(c, u, "<p>Not found.</p>", status=404)
+        owner_id, b = found
+        is_owner = owner_id == u["id"]
+        meta = b.get("meta") or {}
         title = meta.get("title") or mid
         if "notes" in b:
-            lmap = synced_linkmap(c, u["id"])
+            lmap = synced_linkmap(c, owner_id)
             def _resolve(target):
                 import re as _re
                 m2 = lmap.get(_re.sub(r"\s+", " ", target.strip().lower()))
                 return (f"/n/{m2}", True) if m2 else ("#", False)
             body = render_notes_md(b["notes"], link_resolver=_resolve)
-            body += ('<details class=drawer style="margin-top:18px"><summary>Encrypt this note in the browser</summary>'
-                     '<div id=encsetup data-mid="' + esc(mid) + '" data-tr="' + esc(b.get("transcript") or "") + '">'
-                     '<p style="font-size:13.5px;color:var(--muted)">Locks the stored copy with a passphrase that never leaves this tab. '
-                     'Afterwards the site stores only ciphertext for the body, title and transcript. '
-                     'Still visible: that the note exists, when it was made, and the label "Encrypted note". '
-                     'Search and the graph stop reading it. <b>Lose the passphrase and the note cannot be recovered.</b></p>'
-                     '<input type=password id=encnewpp placeholder="New passphrase" autocomplete=off style="font:inherit;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);width:100%;max-width:340px"> '
-                     '<button id=encgo style="margin-top:8px;border:0;cursor:pointer;font:inherit;font-weight:600;padding:9px 18px;border-radius:999px;background:var(--accent);color:#fff">Encrypt the stored copy</button>'
-                     '<p id=encmsg style="font-size:13.5px;color:var(--muted)"></p></div></details>' + ENC_SETUP_JS)
+            if is_owner:
+                body += ('<details class=drawer style="margin-top:18px"><summary>Encrypt this note in the browser</summary>'
+                         '<div id=encsetup data-mid="' + esc(mid) + '" data-tr="' + esc(b.get("transcript") or "") + '">'
+                         '<p style="font-size:13.5px;color:var(--muted)">Locks the stored copy with a passphrase that never leaves this tab. '
+                         'Afterwards the site stores only ciphertext for the body, title and transcript. '
+                         'Still visible: that the note exists, when it was made, and the label "Encrypted note". '
+                         'Search and the graph stop reading it. <b>Lose the passphrase and the note cannot be recovered.</b></p>'
+                         '<input type=password id=encnewpp placeholder="New passphrase" autocomplete=off style="font:inherit;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);width:100%;max-width:340px"> '
+                         '<button id=encgo style="margin-top:8px;border:0;cursor:pointer;font:inherit;font-weight:600;padding:9px 18px;border-radius:999px;background:var(--accent);color:#fff">Encrypt the stored copy</button>'
+                         '<p id=encmsg style="font-size:13.5px;color:var(--muted)"></p></div></details>' + ENC_SETUP_JS)
             edit = (f'<details class=drawer><summary>Edit notes</summary><form method=post action="/n/{esc(mid)}/edit">'
                     f'<textarea name=notes rows=16 style="width:100%;font:13.5px/1.5 ui-monospace,monospace;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)">{esc(b["notes"])}</textarea>'
                     '<p><button style="border:0;cursor:pointer;font:inherit;font-weight:600;padding:9px 18px;border-radius:999px;background:var(--accent);color:#fff">Save</button> '
@@ -999,9 +1152,13 @@ def synced_note(mid: str, req: Request):
                   + "".join(render_transcript_line(l) for l in b["transcript"].splitlines() if l.strip()) + "</div></details>")
         try: when = time.strftime("%B %-d, %Y %H:%M UTC", time.gmtime(float(meta.get("created") or b.get("_server_ts"))))
         except Exception: when = ""
+        comments = comments_html(c, owner_id, mid, u) + comment_form(mid, not is_owner)
+        team_link = (f'<p style="font-size:12.5px;margin-top:14px"><a class=back href="/n/{esc(mid)}/team">People on this note</a></p>' if is_owner and "notes" in b else "")
+        delete_form = (f'<form method=post action="/n/{esc(mid)}/delete" style="margin-top:24px" data-confirm="Remove from the cloud? Your local copy stays."><button style="border:1px solid var(--border);background:transparent;color:#b3261e;cursor:pointer;font:inherit;font-size:13px;padding:6px 14px;border-radius:999px">Remove from cloud</button></form>' if is_owner else "")
+        member_note = ('<div class=props><span>Shared with you - you can read and comment.</span></div>' if not is_owner else "")
         page = (f"<h1 class=title style='font-size:28px'>{esc(title)}</h1><div class=props><span>{when}</span><span>Synced from your device. No audio is stored here.</span></div>"
-                + body + share_ui + tr + edit
-                + f'<form method=post action="/n/{esc(mid)}/delete" style="margin-top:24px" data-confirm="Remove from the cloud? Your local copy stays."><button style="border:1px solid var(--border);background:transparent;color:#b3261e;cursor:pointer;font:inherit;font-size:13px;padding:6px 14px;border-radius:999px">Remove from cloud</button></form>')
+                + member_note + body + (share_ui if is_owner else "") + tr + (edit if is_owner else "")
+                + comments + team_link + delete_form)
         return render_page(c, u, page, active="n:" + mid)
 
 CT_KEYS = ("v", "alg", "kdf", "iter", "salt", "iv", "ct")

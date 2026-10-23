@@ -629,3 +629,54 @@ def test_recap_page_excludes_encrypted_and_labels_tasks(app_client):
     assert "hidden decision" not in html and "Secret" not in html      # encrypted excluded entirely
     assert "stale task" not in html                                    # outside the window
     assert app_client().get("/recap").status_code == 303               # logged out -> login
+
+
+def test_team_membership_flow(app_client):
+    owner, member, stranger = app_client(), app_client(), app_client()
+    signup(owner)
+    H = {"X-Iris-Token": _token(owner, app_client.mod)}
+    _push_note(owner, H, "m-t1", "Team note", "# Team note\n- shared body text")
+    # stranger and member cannot see it yet
+    signup(member); signup(stranger)
+    assert member.get("/n/m-t1").status_code == 404
+    # owner creates an invite (email is a label only)
+    assert owner.post("/n/m-t1/invite", data={"email": "priya@example.com"}).status_code == 303
+    page = owner.get("/n/m-t1/team").text
+    import re as RE
+    tok = RE.search(r"/i/([A-Za-z0-9_-]{16,})", page).group(1)
+    assert "priya@example.com" in page and "never checked" in page
+    # logged-out visitor is asked to log in, no content
+    r = app_client().get("/i/" + tok)
+    assert "shared body text" not in r.text and "Log in" in r.text
+    # member accepts: consent screen names the note and the account shown to the owner
+    r = member.get("/i/" + tok)
+    assert "Team note" in r.text and "Join the note" in r.text
+    assert member.post("/i/" + tok + "/accept").status_code == 303
+    # member can now read and comment; stranger still cannot
+    assert "shared body text" in member.get("/n/m-t1").text
+    assert stranger.get("/n/m-t1").status_code == 404
+    assert member.post("/n/m-t1/comment", data={"body": "looks good to me"}).status_code == 303
+    assert stranger.post("/n/m-t1/comment", data={"body": "intruder"}).status_code == 404
+    page = owner.get("/n/m-t1").text
+    assert "looks good to me" in page and "Comments (1)" in page
+    # member cannot edit, share, invite or delete
+    assert "Edit notes" not in member.get("/n/m-t1").text
+    assert member.post("/n/m-t1/share").status_code == 404
+    assert member.post("/n/m-t1/invite", data={"email": "x@y.z"}).status_code == 404
+    # token is single-account: stranger cannot reuse it
+    assert stranger.post("/i/" + tok + "/accept").status_code == 409
+    # owner removes the member: access and comment form cut immediately
+    with app_client.mod.db() as db:
+        member_uid = db.execute("SELECT accepted_by FROM invites WHERE mid='m-t1' ORDER BY created DESC LIMIT 1").fetchone()["accepted_by"]
+    assert owner.post(f"/n/m-t1/member/{member_uid}/remove").status_code == 303
+    assert member.get("/n/m-t1").status_code == 404
+    assert member.post("/n/m-t1/comment", data={"body": "still here?"}).status_code == 404
+
+
+def test_team_invite_refused_on_encrypted_notes(app_client):
+    c = app_client(); signup(c)
+    H = {"X-Iris-Token": _token(c, app_client.mod)}
+    _push_note(c, H, "m-te", "Enc", "# Enc\n- body")
+    c.post("/n/m-te/browser-encrypt", json={"notes_ct": CT, "title_ct": CT})
+    assert c.post("/n/m-te/invite", data={"email": "a@b.c"}).status_code == 400
+    assert "cannot have members" in c.get("/n/m-te/team").text
