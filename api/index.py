@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS meetings(id text PRIMARY KEY, user_id bigint REFERENC
 ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_hash text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS keep_transcripts boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS api_tokens(token_hash text PRIMARY KEY, user_id bigint REFERENCES users(id) ON DELETE CASCADE, label text NOT NULL DEFAULT '', created timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS shares(token text PRIMARY KEY, user_id bigint REFERENCES users(id) ON DELETE CASCADE, mid text NOT NULL, created double precision NOT NULL);
 CREATE TABLE IF NOT EXISTS synced(user_id bigint REFERENCES users(id) ON DELETE CASCADE, id text NOT NULL, bundle jsonb NOT NULL, server_ts double precision NOT NULL, PRIMARY KEY(user_id,id));
 ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS expires timestamptz NOT NULL DEFAULT now() + interval '90 days';
 ALTER TABLE meetings ADD COLUMN IF NOT EXISTS parts jsonb NOT NULL DEFAULT '[]';
@@ -832,6 +833,73 @@ document.getElementById('encsave').addEventListener('click',function(){
    else st.textContent='Save failed ('+resp.status+')'})})});
 })()</script>"""
 
+# ---------- public share links (explicit per-note opt-in) ----------
+def _share_url(req, token):
+    return str(req.base_url).rstrip("/") + "/s/" + token
+
+def share_block(c, u, mid, b, req):
+    """Share UI for a plaintext synced note; empty string for anything encrypted."""
+    if "notes" not in b:
+        return ""
+    r = c.execute("SELECT token FROM shares WHERE user_id=%s AND mid=%s", (u["id"], mid)).fetchone()
+    if r:
+        url = _share_url(req, r["token"])
+        return (f'<details class=drawer style="margin-top:18px" open><summary>Shared</summary>'
+                f'<p style="font-size:13.5px;color:var(--muted)">Anyone with this link can read this note - no account needed:</p>'
+                f'<p><a class=wikilink href="{url}">{esc(url)}</a></p>'
+                f'<form method=post action="/n/{esc(mid)}/unshare" data-confirm="Stop sharing? The link stops working immediately.">'
+                f'<button style="border:1px solid var(--border);background:transparent;color:#b3261e;cursor:pointer;font:inherit;font-size:13px;padding:6px 14px;border-radius:999px">Stop sharing</button></form></details>')
+    return (f'<details class=drawer style="margin-top:18px"><summary>Share this note</summary>'
+            f'<p style="font-size:13.5px;color:var(--muted)">Creates a public link. <b>Anyone with the link can read this note</b> - '
+            f'no account needed. The page asks search engines not to index it, but treat the link itself as the only protection. '
+            f'You can stop sharing anytime. Browser-encrypted notes cannot be shared, because this site cannot read them.</p>'
+            f'<form method=post action="/n/{esc(mid)}/share" data-confirm="Anyone with the link will be able to read this note. Create the public link?">'
+            f'<button style="border:0;cursor:pointer;font:inherit;font-weight:600;padding:9px 18px;border-radius:999px;background:var(--accent);color:#fff">Create public link</button></form></details>')
+
+@app.post("/n/{mid}/share")
+def share_create(mid: str, req: Request):
+    import secrets
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        r = c.execute("SELECT bundle FROM synced WHERE user_id=%s AND id=%s", (u["id"], mid)).fetchone()
+        if not r: return _err("not found", 404)
+        if "notes" not in r["bundle"]:
+            return _err("this note is encrypted - the site cannot read it, so it cannot be shared", 400)
+        if not c.execute("SELECT 1 FROM shares WHERE user_id=%s AND mid=%s", (u["id"], mid)).fetchone():
+            c.execute("INSERT INTO shares(token,user_id,mid,created) VALUES(%s,%s,%s,%s)",
+                      (secrets.token_urlsafe(16), u["id"], mid, time.time()))
+        return RedirectResponse(f"/n/{mid}", status_code=303)
+
+@app.post("/n/{mid}/unshare")
+def share_revoke(mid: str, req: Request):
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        c.execute("DELETE FROM shares WHERE user_id=%s AND mid=%s", (u["id"], mid))
+        return RedirectResponse(f"/n/{mid}", status_code=303)
+
+@app.get("/s/{token}", response_class=HTMLResponse)
+def shared_page(token: str, req: Request):
+    with db() as c:
+        r = c.execute("SELECT s.mid, s.user_id, y.bundle FROM shares s JOIN synced y ON y.user_id=s.user_id AND y.id=s.mid WHERE s.token=%s",
+                      (token,)).fetchone()
+        if not r: return render_page(c, None, "<p>This link is not shared anymore.</p>", status=404)
+        b = r["bundle"]
+        if "notes" not in b:   # note became encrypted after sharing: the link must stop disclosing
+            return render_page(c, None, "<p>This note is no longer shared.</p>", status=404)
+        meta = b.get("meta") or {}
+        title = meta.get("title") or r["mid"]
+        try: when = time.strftime("%B %-d, %Y", time.gmtime(float(meta.get("created") or b.get("_server_ts"))))
+        except Exception: when = ""
+        body = (f"<h1 class=title style='font-size:28px'>{esc(title)}</h1>"
+                f"<div class=props><span>{when} &middot; shared from Iris</span></div>"
+                + render_notes_md(b["notes"]))
+        doc = (PAGE.replace("<!--PWA-->", '<meta name="robots" content="noindex,nofollow">')
+               + f'<main class=content style="margin:0 auto;max-width:760px;padding:32px 20px"><div class=doc>{body}</div>'
+                 '<p style="margin-top:36px;font-size:12.5px;color:var(--muted)">Shared from <a class=wikilink href="https://github.com/h55n/iris">Iris</a>, a local-first notetaker.</p></main>')
+        return HTMLResponse(doc, headers={"X-Robots-Tag": "noindex, nofollow"})
+
 # ---------- synced notes (viewer and editor) ----------
 @app.get("/n/{mid}", response_class=HTMLResponse)
 def synced_note(mid: str, req: Request):
@@ -885,6 +953,7 @@ def synced_note(mid: str, req: Request):
                     "Open them in the local Iris app or the Android app, which hold your key.</p>"); edit = ""
         else:
             body = "<p style='color:var(--muted)'>No notes in this synced meeting yet.</p>"; edit = ""
+        share_ui = share_block(c, u, mid, b, req)
         tr = ""
         if b.get("transcript"):
             tr = (f'<details class=drawer><summary>Transcript</summary><div class=tr>'
@@ -892,7 +961,7 @@ def synced_note(mid: str, req: Request):
         try: when = time.strftime("%B %-d, %Y %H:%M UTC", time.gmtime(float(meta.get("created") or b.get("_server_ts"))))
         except Exception: when = ""
         page = (f"<h1 class=title style='font-size:28px'>{esc(title)}</h1><div class=props><span>{when}</span><span>Synced from your device. No audio is stored here.</span></div>"
-                + body + tr + edit
+                + body + share_ui + tr + edit
                 + f'<form method=post action="/n/{esc(mid)}/delete" style="margin-top:24px" data-confirm="Remove from the cloud? Your local copy stays."><button style="border:1px solid var(--border);background:transparent;color:#b3261e;cursor:pointer;font:inherit;font-size:13px;padding:6px 14px;border-radius:999px">Remove from cloud</button></form>')
         return render_page(c, u, page, active="n:" + mid)
 

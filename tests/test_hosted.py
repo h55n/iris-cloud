@@ -566,3 +566,46 @@ def test_cloud_graph_hides_links_into_encrypted_notes(app_client):
     assert data["edges"] == []                                   # no link drawn into the hidden note
     titles = {n["title"] for n in data["nodes"]}
     assert "Encrypted note" in titles and "Secret title" not in titles
+
+
+def test_share_link_flow_and_revoke(app_client):
+    c, stranger = app_client(), app_client()
+    signup(c)
+    H = {"X-Iris-Token": _token(c, app_client.mod)}
+    _push_note(c, H, "m-s", "Shared note", "# Shared note\n- a **bold** claim")
+    assert "Create public link" in c.get("/n/m-s").text
+    assert c.post("/n/m-s/share").status_code == 303
+    with app_client.mod.db() as db:
+        tok = db.execute("SELECT token FROM shares WHERE mid='m-s' ORDER BY created DESC LIMIT 1").fetchone()["token"]
+    assert len(tok) >= 20
+    page = c.get("/n/m-s").text
+    assert "/s/" + tok in page and "Stop sharing" in page
+    r = stranger.get("/s/" + tok)
+    assert r.status_code == 200 and "a <strong>bold</strong> claim" in r.text
+    assert "noindex" in r.text and r.headers.get("x-robots-tag", "").startswith("noindex")
+    assert "Edit notes" not in r.text and "Stop sharing" not in r.text and "iris-cloud.invalid" not in r.text
+    c.post("/n/m-s/share")
+    assert c.get("/s/" + tok).status_code == 200
+    c.post("/n/m-s/unshare")
+    assert stranger.get("/s/" + tok).status_code == 404
+    assert stranger.get("/s/nope-nope-nope").status_code == 404
+
+
+def test_share_refuses_encrypted_notes_and_stops_disclosing(app_client):
+    c, stranger = app_client(), app_client()
+    signup(c)
+    H = {"X-Iris-Token": _token(c, app_client.mod)}
+    _push_note(c, H, "m-x", "Will encrypt", "# Will encrypt\n- soon hidden")
+    c.post("/n/m-x/share")
+    with app_client.mod.db() as db:
+        tok = db.execute("SELECT token FROM shares WHERE mid='m-x' ORDER BY created DESC LIMIT 1").fetchone()["token"]
+    assert stranger.get("/s/" + tok).status_code == 200
+    assert c.post("/n/m-x/browser-encrypt", json={"notes_ct": CT, "title_ct": CT}).status_code == 200
+    r = stranger.get("/s/" + tok)
+    assert r.status_code == 404 and "soon hidden" not in r.text
+    assert c.post("/n/m-x/share").status_code == 400
+    assert "Create public link" not in c.get("/n/m-x").text
+    _push_note(c, H, "m-z", "Age note", "# Age note")
+    with app_client.mod.db() as db:
+        db.execute("UPDATE synced SET bundle = jsonb_build_object('meta', bundle->'meta', 'notes_age', 'AGE-1-x') WHERE id='m-z'")
+    assert c.post("/n/m-z/share").status_code == 400
