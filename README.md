@@ -2,6 +2,8 @@
 
 The web side of [Iris](https://github.com/h55n/iris). Iris records, transcribes and writes meeting notes **on your own device** with local models. This site holds the finished notes so you can read and edit them from any device, like Notion or Granola. Audio is never uploaded in the normal path.
 
+- **Linked notes and a note graph** - `[[links]]` between synced notes, and a Graph page that maps them.
+
 ## How it works
 1. Sign up here, then make a sync token on the Account page.
 2. In the local app run `python3 iris/cli.py sync --server https://iris-cloud-one.vercel.app/sync --notes-only` with `IRIS_SYNC_TOKEN` set.
