@@ -194,7 +194,7 @@ def sidebar(c, user, active=None):
           '<div style="padding:8px 12px"><a href="/login">Log in</a> &middot; <a href="/signup">Sign up</a></div>'
     return ('<input type=checkbox id=navtoggle><label for=navtoggle class=menubtn>Menu</label>'
             '<a href="/" style="text-decoration:none;color:inherit"><div class=brand>Iris<span id=tagline>meeting notes that keep receipts</span></div></a>'
-            + ('<a class="folder" href="/record" style="margin:6px 0"><span class=chev></span>Backup recorder</a><a class="folder" href="/graph" style="margin:0 0 6px"><span class=chev></span>Graph</a>' if user else '')
+            + ('<a class="folder" href="/record" style="margin:6px 0"><span class=chev></span>Backup recorder</a><a class="folder" href="/graph" style="margin:0 0 6px"><span class=chev></span>Graph</a><a class="folder" href="/recap" style="margin:0 0 6px"><span class=chev></span>Recap</a>' if user else '')
             + '<div class=nav>' + (f'<div class=nav-sec>Meetings</div>{items or "<div class=nav-meta style=padding:8px>Nothing recorded yet</div>"}' if user else '') + '</div>'
             + who
             + '<div class=themes><span class=lbl>Theme</span>' + ''.join(
@@ -832,6 +832,45 @@ document.getElementById('encsave').addEventListener('click',function(){
     document.getElementById('enctitle').textContent=title;st.textContent='Saved. Only ciphertext left this tab.'}
    else st.textContent='Save failed ('+resp.status+')'})})});
 })()</script>"""
+
+@app.get("/recap", response_class=HTMLResponse)
+def recap_page(req: Request):
+    from iris import recap as RC
+    from iris.links import extract as _extract
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        rows = c.execute("SELECT id, bundle FROM synced WHERE user_id=%s AND id NOT LIKE '\\_%%'", (u["id"],)).fetchall()
+        entries = []
+        for r in rows:
+            b = r["bundle"]
+            if "notes" not in b:   # browser- or device-encrypted: the recap never sees them
+                continue
+            meta = b.get("meta") or {}
+            try: created = float(meta.get("created") or b.get("_server_ts") or 0)
+            except Exception: created = 0
+            entries.append((meta.get("title") or r["id"], created, b["notes"], len(_extract(b["notes"]))))
+        rep = RC.summarize(entries)
+        body = ('<h1 class=title style="font-size:30px">Weekly recap</h1>'
+                "<p style='color:var(--muted);font-size:13.5px'>The last 7 days of your synced notes, generated when you opened this page. "
+                "Action items are extracted from the notes, not confirmed as outstanding. Encrypted notes are not included.</p>")
+        body += f'<h2>{len(rep["meetings"])} synced note{"s" if len(rep["meetings"]) != 1 else ""}</h2>'
+        for m in rep["meetings"]:
+            when = time.strftime("%a %b %-d", time.gmtime(m["created"])) if m["created"] else ""
+            body += f'<div class=bullet>{esc(m["title"])} <span style="color:var(--muted);font-size:12.5px">{when}</span></div>'
+        if rep["decisions"]:
+            body += "<h2>Decisions</h2>"
+            for d in rep["decisions"]:
+                body += f'<div class=bullet>{esc(d["text"])} <span style="color:var(--muted);font-size:12.5px">- {esc(d["source"])}</span></div>'
+        if rep["actions"]:
+            body += "<h2>Action items</h2>"
+            for a in rep["actions"]:
+                cls, box = ("todo done", "box on") if a["done"] else ("todo", "box")
+                body += (f'<div class="{cls}"><span class="{box}"></span><span>{esc(a["text"])}'
+                         f' <span style="color:var(--muted);font-size:12.5px">- {esc(a["source"])}</span></span></div>')
+        if rep["link_count"]:
+            body += f'<p style="color:var(--muted);font-size:13px">{rep["link_count"]} [[link]]{"s" if rep["link_count"] != 1 else ""} written this week. <a class=wikilink href="/graph">Open the graph</a></p>'
+        return render_page(c, u, body)
 
 # ---------- public share links (explicit per-note opt-in) ----------
 def _share_url(req, token):

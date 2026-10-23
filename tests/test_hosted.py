@@ -609,3 +609,23 @@ def test_share_refuses_encrypted_notes_and_stops_disclosing(app_client):
     with app_client.mod.db() as db:
         db.execute("UPDATE synced SET bundle = jsonb_build_object('meta', bundle->'meta', 'notes_age', 'AGE-1-x') WHERE id='m-z'")
     assert c.post("/n/m-z/share").status_code == 400
+
+
+def test_recap_page_excludes_encrypted_and_labels_tasks(app_client):
+    import time as T
+    c = app_client(); signup(c)
+    H = {"X-Iris-Token": _token(c, app_client.mod)}
+    now = T.time()
+    for mid2, t2, n2 in (("m-r1", "Standup", "# Standup\n## Action items\n- [ ] email the vendor\n"),
+                         ("m-r2", "Secret", "# Secret\n## Decisions\n- hidden decision\n")):
+        b2 = {"id": mid2, "meta": {"title": t2, "created": now}, "notes": n2}
+        assert c.post(f"/sync/push/{mid2}", json=b2, headers=H).status_code == 200
+    c.post("/n/m-r2/browser-encrypt", json={"notes_ct": CT, "title_ct": CT})
+    with app_client.mod.db() as db:   # an old note outside the 7-day window
+        db.execute("INSERT INTO synced(user_id,id,bundle,server_ts) VALUES((SELECT id FROM users ORDER BY id DESC LIMIT 1),'m-old',%s,%s)",
+                   (json.dumps({"id": "m-old", "meta": {"title": "Old", "created": now - 9 * 86400}, "notes": "# Old\n- [ ] stale task"}), now - 9 * 86400))
+    html = c.get("/recap").text
+    assert "email the vendor" in html and "not confirmed as outstanding" in html
+    assert "hidden decision" not in html and "Secret" not in html      # encrypted excluded entirely
+    assert "stale task" not in html                                    # outside the window
+    assert app_client().get("/recap").status_code == 303               # logged out -> login
