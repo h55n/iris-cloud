@@ -19,7 +19,7 @@ Last audit: 22 Oct 2026, by the author. Every claim below has a test in `tests/t
 - Synced notes are plain text in the database unless encrypted on the device first. The site cannot show encrypted notes.
 - There is no email verification. Signup tells you when an email is already taken (account enumeration). Lose the password and the recovery code and the account is gone.
 - Sync tokens do not expire. Sessions are not listed per device.
-- The CSP allows inline scripts and styles because the pages use them. A nonce-based policy is not done.
+- Scripts are locked to self plus a per-response CSP nonce (inline event handlers are gone). Styles are still inline, which is the remaining CSP gap.
 - Backup mode sends audio to Groq. What Groq does with it is governed by Groq's terms, not ours. Do not use it for confidential meetings.
 - The database is a shared free-tier Neon instance. We have no extra encryption layer on top of Neon's.
 

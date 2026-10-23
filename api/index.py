@@ -111,8 +111,8 @@ def current_user(c, req: Request):
     return c.execute("SELECT u.id, u.email FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=%s AND s.expires>now()", (_th(tok),)).fetchone()
 
 # ---------- security: headers, cross-site request refusal, per-IP throttles ----------
-CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
-       "media-src 'self' blob:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'")
+CSP_BASE = ("default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "media-src 'self' blob:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'")
 
 def client_ip(req: Request) -> str:
     # Vercel sets these itself, so a caller cannot choose them
@@ -129,7 +129,16 @@ async def security_layer(req: Request, call_next):
               (origin is None and req.headers.get("sec-fetch-site") == "cross-site")
         if bad: return JSONResponse({"error": "cross-site request refused"}, status_code=403)
     resp = await call_next(req)
-    resp.headers["Content-Security-Policy"] = CSP
+    if "text/html" in resp.headers.get("content-type", ""):
+        nonce = secrets.token_urlsafe(16)
+        raw = b"".join([bytes(c) async for c in resp.body_iterator])
+        body = raw.replace(b"<script", b'<script nonce="' + nonce.encode() + b'"')
+        async def _one(b): yield b
+        resp.body_iterator = _one(body)
+        resp.headers["content-length"] = str(len(body))
+        resp.headers["Content-Security-Policy"] = CSP_BASE + f"; script-src 'self' 'nonce-{nonce}'"
+    else:
+        resp.headers["Content-Security-Policy"] = CSP_BASE + "; script-src 'self'"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Referrer-Policy"] = "same-origin"   # "no-referrer" makes browsers send Origin: null on our own forms, which the CSRF check refuses
     resp.headers["X-Frame-Options"] = "DENY"
@@ -187,17 +196,22 @@ def sidebar(c, user, active=None):
             + '<div class=nav>' + (f'<div class=nav-sec>Meetings</div>{items or "<div class=nav-meta style=padding:8px>Nothing recorded yet</div>"}' if user else '') + '</div>'
             + who
             + '<div class=themes><span class=lbl>Theme</span>' + ''.join(
-                f'<button class=dot data-t="{t}" title="{t or "green"}" onclick="pickTheme(\'{t}\',this)"></button>'
+                f'<button class=dot data-t="{t}" title="{t or "green"}"></button>'
                 for t in ("", "blue", "purple", "orange", "pink", "red")) + '</div>'
             + '<script>function pickTheme(t,b){if(t)document.documentElement.dataset.theme=t;else delete document.documentElement.dataset.theme;'
               'try{localStorage.setItem("iris-theme",t)}catch(e){}document.querySelectorAll(".dot").forEach(function(d){d.classList.remove("sel")});b.classList.add("sel")}'
-              '(function(){var cur="";try{cur=localStorage.getItem("iris-theme")||""}catch(e){}var d=document.querySelector(\'.dot[data-t="\'+cur+\'"]\');if(d)d.classList.add("sel")})()</script>')
+              '(function(){var cur="";try{cur=localStorage.getItem("iris-theme")||""}catch(e){}var d=document.querySelector(\'.dot[data-t="\'+cur+\'"]\');if(d)d.classList.add("sel")})()'
+              'document.querySelectorAll(".dot").forEach(function(b){b.addEventListener("click",function(){pickTheme(b.dataset.t,b)})})</script>')
+
+DELEGATE_JS = ("<script>document.addEventListener('change',function(e){if(e.target.dataset&&e.target.dataset.autosubmit!==undefined)e.target.form.submit()});"
+               "document.addEventListener('submit',function(e){var m=e.target.dataset&&e.target.dataset.confirm;if(m&&!confirm(m))e.preventDefault()});"
+               "</script>")
 
 def render_page(c, user, body, active=None, status=200):
     from iris import pwa as W
     inner = (f'<div class=layout><nav class=sidebar>{sidebar(c, user, active)}</nav>'
              f'<main class=content><div class=doc>{body}</div></main></div>')
-    doc = (PAGE.replace("<!--PWA-->", W.HEAD_TAGS) + inner + W.SW_REGISTER)
+    doc = (PAGE.replace("<!--PWA-->", W.HEAD_TAGS) + inner + DELEGATE_JS + W.SW_REGISTER)
     return HTMLResponse(doc, status_code=status)
 
 def render_page_msg(msg):
@@ -610,11 +624,11 @@ def meeting(mid: str, req: Request):
             f"<p style='color:var(--muted)'>Status: {esc(m['status'])}" + (f" - {esc(m['error'])}" if m["error"] else "") + "</p>" + retry)
         tr = "".join(render_transcript_line(l) for l in tmd.splitlines() if l.strip())
         body = ((mascot(110, "celebrate") + "<div class=empty style='padding-top:0'><div class=t>Meeting saved</div></div>") if m["status"] == "done" and (time.time() - m["created"].timestamp()) < 600 else "")
-        body += (f'<form method=post action="/m/{mid}/rename" style="margin:0"><input name=title class=title value="{esc(m["title"] or "Untitled meeting")}" maxlength=120 style="width:100%" aria-label="Title" onchange="this.form.submit()"></form>'
+        body += (f'<form method=post action="/m/{mid}/rename" style="margin:0"><input name=title class=title value="{esc(m["title"] or "Untitled meeting")}" maxlength=120 style="width:100%" aria-label="Title" data-autosubmit></form>'
                  f'<div class=props><span>{m["created"].strftime("%B %-d, %Y %H:%M UTC")}</span></div>'
                  + notes_html
                  + (f'<details class=drawer><summary>Transcript ({len(segs)} lines)</summary><div class=tr>{tr}</div></details>' if segs else "")
-                 + f'<form method=post action="/m/{mid}/delete" onsubmit="return confirm(\'Delete this meeting for good?\')" style="margin-top:24px"><button class=danger>Delete meeting</button></form>')
+                 + f'<form method=post action="/m/{mid}/delete" data-confirm="Delete this meeting for good?" style="margin-top:24px"><button class=danger>Delete meeting</button></form>')
         return render_page(c, u, body, active=mid)
 
 @app.post("/m/{mid}/rename")
@@ -718,7 +732,7 @@ def synced_note(mid: str, req: Request):
         except Exception: when = ""
         page = (f"<h1 class=title style='font-size:28px'>{esc(title)}</h1><div class=props><span>{when}</span><span>Synced from your device. No audio is stored here.</span></div>"
                 + body + tr + edit
-                + f'<form method=post action="/n/{esc(mid)}/delete" style="margin-top:24px" onsubmit="return confirm(\'Remove from the cloud? Your local copy stays.\')"><button style="border:1px solid var(--border);background:transparent;color:#b3261e;cursor:pointer;font:inherit;font-size:13px;padding:6px 14px;border-radius:999px">Remove from cloud</button></form>')
+                + f'<form method=post action="/n/{esc(mid)}/delete" style="margin-top:24px" data-confirm="Remove from the cloud? Your local copy stays."><button style="border:1px solid var(--border);background:transparent;color:#b3261e;cursor:pointer;font:inherit;font-size:13px;padding:6px 14px;border-radius:999px">Remove from cloud</button></form>')
         return render_page(c, u, page, active="n:" + mid)
 
 @app.post("/n/{mid}/edit")

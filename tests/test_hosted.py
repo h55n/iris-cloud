@@ -448,3 +448,25 @@ def test_sync_tokens_expire(app_client):
 def test_favicon_does_not_404(app_client):
     r = app_client().get("/favicon.ico")
     assert r.status_code == 200 and r.headers["content-type"] == "image/png" and len(r.content) > 100
+
+
+def test_csp_uses_a_per_page_nonce_and_no_unsafe_inline_scripts(app_client):
+    c = app_client(); signup(c)
+    import re
+    for path in ("/account", "/"):
+        r = c.get(path)
+        csp = r.headers["content-security-policy"]
+        assert "unsafe-inline" not in csp.split("script-src")[1].split(";")[0], csp
+        m = re.search(r"script-src 'self' 'nonce-([^']+)'", csp)
+        assert m, csp
+        nonce = m.group(1)
+        scripts = re.findall(r"<script([^>]*)>", r.text)
+        assert scripts, path  # pages do carry scripts; they must all be nonced
+        assert all(f'nonce="{nonce}"' in attrs for attrs in scripts), path
+        assert "onclick=" not in r.text and "onsubmit=" not in r.text and "onchange=" not in r.text
+
+
+def test_non_html_gets_strict_csp(app_client):
+    r = app_client().get("/sw.js")
+    csp = r.headers["content-security-policy"]
+    assert csp.endswith("script-src 'self'") and "nonce" not in csp  # style stays inline; scripts do not
