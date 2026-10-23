@@ -44,8 +44,8 @@ CREATE TABLE IF NOT EXISTS meetings(id text PRIMARY KEY, user_id bigint REFERENC
 ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_hash text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS keep_transcripts boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS api_tokens(token_hash text PRIMARY KEY, user_id bigint REFERENCES users(id) ON DELETE CASCADE, label text NOT NULL DEFAULT '', created timestamptz DEFAULT now());
-ALTER TABLE IF EXISTS invites ADD COLUMN IF NOT EXISTS approved boolean NOT NULL DEFAULT false;
-CREATE TABLE IF NOT EXISTS invites(token text PRIMARY KEY, owner_id bigint REFERENCES users(id) ON DELETE CASCADE, mid text NOT NULL, email_text text NOT NULL DEFAULT '', created double precision NOT NULL, accepted_by bigint REFERENCES users(id) ON DELETE CASCADE, revoked boolean NOT NULL DEFAULT false);
+CREATE TABLE IF NOT EXISTS invites(token text PRIMARY KEY, owner_id bigint REFERENCES users(id) ON DELETE CASCADE, mid text NOT NULL, email_text text NOT NULL DEFAULT '', created double precision NOT NULL, accepted_by bigint REFERENCES users(id) ON DELETE CASCADE, revoked boolean NOT NULL DEFAULT false, approved boolean NOT NULL DEFAULT false);
+ALTER TABLE invites ADD COLUMN IF NOT EXISTS approved boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS note_comments(id bigserial PRIMARY KEY, owner_id bigint REFERENCES users(id) ON DELETE CASCADE, mid text NOT NULL, author_id bigint REFERENCES users(id) ON DELETE CASCADE, body text NOT NULL, created double precision NOT NULL);
 CREATE TABLE IF NOT EXISTS shares(token text PRIMARY KEY, user_id bigint REFERENCES users(id) ON DELETE CASCADE, mid text NOT NULL, created double precision NOT NULL);
 CREATE TABLE IF NOT EXISTS synced(user_id bigint REFERENCES users(id) ON DELETE CASCADE, id text NOT NULL, bundle jsonb NOT NULL, server_ts double precision NOT NULL, PRIMARY KEY(user_id,id));
