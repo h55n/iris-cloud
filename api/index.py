@@ -44,6 +44,7 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_hash text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS keep_transcripts boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS api_tokens(token_hash text PRIMARY KEY, user_id bigint REFERENCES users(id) ON DELETE CASCADE, label text NOT NULL DEFAULT '', created timestamptz DEFAULT now());
 CREATE TABLE IF NOT EXISTS synced(user_id bigint REFERENCES users(id) ON DELETE CASCADE, id text NOT NULL, bundle jsonb NOT NULL, server_ts double precision NOT NULL, PRIMARY KEY(user_id,id));
+ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS expires timestamptz NOT NULL DEFAULT now() + interval '90 days';
 ALTER TABLE meetings ADD COLUMN IF NOT EXISTS parts jsonb NOT NULL DEFAULT '[]';
 CREATE INDEX IF NOT EXISTS meetings_user ON meetings(user_id, created DESC);
 """
@@ -199,6 +200,10 @@ def render_page(c, user, body, active=None, status=200):
     doc = (PAGE.replace("<!--PWA-->", W.HEAD_TAGS) + inner + W.SW_REGISTER)
     return HTMLResponse(doc, status_code=status)
 
+def render_page_msg(msg):
+    with db() as c:
+        return render_page(c, None, f"<p>{esc(msg)}</p><p><a href='/account'>Back to account</a></p>")
+
 PRIVACY = ("<p style='color:var(--muted);font-size:13.5px;line-height:1.55'><b>Your audio stays on your device.</b> "
            "The local Iris app records, transcribes and writes the notes on your own machine, with models that run there. "
            "Only the finished notes sync to this site, tied to your account. Transcripts stay off unless you turn them on in Account, and audio is never uploaded. "
@@ -340,10 +345,10 @@ def account(req: Request):
         u = current_user(c, req)
         if not u: return RedirectResponse("/login", status_code=303)
         keep = c.execute("SELECT keep_transcripts FROM users WHERE id=%s", (u["id"],)).fetchone()["keep_transcripts"]
-        toks = c.execute("SELECT token_hash,label,created FROM api_tokens WHERE user_id=%s ORDER BY created", (u["id"],)).fetchall()
+        toks = c.execute("SELECT token_hash,label,created,expires FROM api_tokens WHERE user_id=%s ORDER BY created", (u["id"],)).fetchall()
         btn = "border:0;cursor:pointer;font:inherit;font-weight:600;padding:9px 18px;border-radius:999px;background:var(--accent);color:#fff"
         inp = "font:inherit;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)"
-        rows = "".join(f'<li style="margin:6px 0">{esc(t["label"] or "token")} <span style="color:var(--muted)">&middot; made {t["created"].strftime("%b %-d")}</span> '
+        rows = "".join(f'<li style="margin:6px 0">{esc(t["label"] or "token")} <span style="color:var(--muted)">&middot; made {t["created"].strftime("%b %-d")}, expires {t["expires"].strftime("%b %-d")}</span> '
                        f'<form method=post action="/account/token/revoke" style="display:inline"><input type=hidden name=h value="{t["token_hash"]}"><button style="border:0;background:none;color:#b3261e;cursor:pointer;font:inherit">Revoke</button></form></li>' for t in toks)
         return render_page(c, u, "<h1 class=title style='font-size:28px'>Account</h1>"
             "<h2 class=big>Sync from your devices</h2>"
@@ -353,10 +358,56 @@ def account(req: Request):
             "<h2 class=big style='margin-top:28px'>Transcripts</h2>"
             f"<p>Off by default: only notes are stored. Turn on to also keep transcripts for your synced meetings. Turning it off deletes the stored transcripts. Currently <b>{'on' if keep else 'off'}</b>.</p>"
             f'<form method=post action="/account/transcripts"><input type=hidden name=on value="{0 if keep else 1}"><button style="{btn}">{"Turn off and delete stored transcripts" if keep else "Turn on"}</button></form>'
+            "<h2 class=big style='margin-top:28px'>Password and sign-in</h2>"
+            f'<form method=post action="/account/password" style="display:flex;flex-direction:column;gap:8px;max-width:340px"><input name=current type=password required placeholder="Current password" autocomplete=current-password style="{inp}"><input name=new type=password required minlength=8 placeholder="New password (8+ characters)" autocomplete=new-password style="{inp}"><button style="{btn}">Change password</button></form>'
+            f'<form method=post action="/account/recovery" style="display:flex;gap:8px;flex-wrap:wrap;max-width:420px;margin-top:14px"><input name=password type=password required placeholder="Password" autocomplete=current-password style="{inp};flex:1;min-width:160px"><button style="{btn}">Make a new recovery code</button></form>'
+            '<form method=post action="/account/signout-everywhere" style="margin-top:14px"><button style="border:1px solid var(--border);background:transparent;color:var(--text);cursor:pointer;font:inherit;padding:9px 18px;border-radius:999px">Sign out on all devices</button></form>'
             "<h2 class=big style='margin-top:28px'>Delete account</h2>"
             "<p>Removes your meetings, synced notes and tokens from the database. This cannot be undone.</p>"
             f'<form method=post action="/account/delete" style="display:flex;flex-direction:column;gap:10px;max-width:340px"><input name=password type=password required placeholder="Confirm password" style="{inp}">'
             '<button style="border:0;cursor:pointer;font:inherit;font-weight:600;padding:10px 20px;border-radius:999px;background:#b3261e;color:#fff">Delete my account</button></form>')
+
+@app.post("/account/password")
+async def account_password(req: Request):
+    f = await _form(req); new = f.get("new") or ""
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        row = c.execute("SELECT pw_hash FROM users WHERE id=%s", (u["id"],)).fetchone()
+        if ip_limited(c, req, "login"): return render_page(c, u, "<p>Too many attempts. Wait ten minutes.</p>", status=429)
+        if not check_pw(f.get("current") or "", row["pw_hash"]):
+            return render_page(c, u, "<p style='color:var(--danger,#b3261e)'>Current password is wrong. Nothing changed.</p><p><a href='/account'>Back</a></p>", status=401)
+        if len(new) < 8 or len(new) > 200:
+            return render_page(c, u, "<p style='color:var(--danger,#b3261e)'>Use a new password of 8 to 200 characters.</p><p><a href='/account'>Back</a></p>", status=400)
+        c.execute("UPDATE users SET pw_hash=%s WHERE id=%s", (hash_pw(new), u["id"]))
+        keep = _th(req.cookies.get(COOKIE) or "")
+        c.execute("DELETE FROM sessions WHERE user_id=%s AND token_hash<>%s", (u["id"], keep))   # other devices sign out
+    return render_page_msg("Password changed. Other devices were signed out.")
+
+@app.post("/account/recovery")
+async def account_recovery(req: Request):
+    f = await _form(req)
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        row = c.execute("SELECT pw_hash FROM users WHERE id=%s", (u["id"],)).fetchone()
+        if not check_pw(f.get("password") or "", row["pw_hash"]):
+            return render_page(c, u, "<p style='color:var(--danger,#b3261e)'>Wrong password. Nothing changed.</p><p><a href='/account'>Back</a></p>", status=401)
+        code, h = new_recovery()
+        c.execute("UPDATE users SET recovery_hash=%s WHERE id=%s", (h, u["id"]))
+        return render_page(c, u, "<p>Your old recovery code no longer works. Here is the new one.</p>" + recovery_page(code, "/account"))
+
+@app.post("/account/signout-everywhere")
+def account_signout_everywhere(req: Request):
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        c.execute("DELETE FROM sessions WHERE user_id=%s", (u["id"],))
+    resp = RedirectResponse("/login", status_code=303); resp.delete_cookie(COOKIE, path="/"); return resp
+
+@app.get("/favicon.ico")
+def favicon():
+    return Response(W.asset("icon-192.png") or b"", media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
 
 @app.post("/logout")
 def logout(req: Request):
@@ -594,7 +645,7 @@ AUDIO_KEYS = ("audio", "audio_b64", "audio_files_b64")
 def token_user(c, req: Request):
     tok = req.headers.get("x-iris-token") or req.headers.get("x-convo-token") or ""   # older Android builds send the legacy header
     if not tok: return None
-    return c.execute("SELECT u.id, u.email, u.keep_transcripts FROM api_tokens t JOIN users u ON u.id=t.user_id WHERE t.token_hash=%s", (_th(tok),)).fetchone()
+    return c.execute("SELECT u.id, u.email, u.keep_transcripts FROM api_tokens t JOIN users u ON u.id=t.user_id WHERE t.token_hash=%s AND t.expires>now()", (_th(tok),)).fetchone()
 
 def _sid_ok(mid): return bool(re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", mid)) and ".." not in mid
 

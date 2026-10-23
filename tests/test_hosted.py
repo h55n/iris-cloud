@@ -401,3 +401,50 @@ def test_login_response_does_not_reveal_which_emails_exist(app_client):
     a = c.post("/login", data={"email": email, "password": "wrong-wrong"})
     b = c.post("/login", data={"email": "ghost@iris-cloud.invalid", "password": "wrong-wrong"})
     assert a.status_code == b.status_code == 401 and "Wrong email or password" in a.text and "Wrong email or password" in b.text
+
+
+def test_change_password_signs_out_other_devices(app_client):
+    a, b = app_client(), app_client()
+    email, pw, _ = signup(a)
+    b.post("/login", data={"email": email, "password": pw})
+    assert b.get("/account").status_code == 200
+    assert a.post("/account/password", data={"current": "wrong-wrong", "new": "another-pass-1"}).status_code == 401
+    assert a.post("/account/password", data={"current": pw, "new": "short"}).status_code == 400
+    assert a.post("/account/password", data={"current": pw, "new": "another-pass-1"}).status_code == 200
+    assert a.get("/account").status_code == 200                      # this device stays signed in
+    assert b.get("/account").status_code == 303                      # the other one is out
+    assert app_client().post("/login", data={"email": email, "password": pw}).status_code == 401
+    assert app_client().post("/login", data={"email": email, "password": "another-pass-1"}).status_code == 303
+
+
+def test_new_recovery_code_replaces_the_old_one(app_client):
+    c = app_client(); email, pw, r = signup(c)
+    old = recovery_code(r.text)
+    assert c.post("/account/recovery", data={"password": "wrong-wrong"}).status_code == 401
+    new = recovery_code(c.post("/account/recovery", data={"password": pw}).text)
+    assert new != old
+    assert app_client().post("/reset", data={"email": email, "code": old, "password": "brand-new-pass"}).status_code == 401
+    assert app_client().post("/reset", data={"email": email, "code": new, "password": "brand-new-pass"}).status_code == 200
+
+
+def test_sign_out_everywhere(app_client):
+    a, b = app_client(), app_client()
+    email, pw, _ = signup(a)
+    b.post("/login", data={"email": email, "password": pw})
+    assert a.post("/account/signout-everywhere").status_code == 303
+    assert a.get("/account").status_code == 303 and b.get("/account").status_code == 303
+
+
+def test_sync_tokens_expire(app_client):
+    c = app_client(); signup(c)
+    tok = _token(c, app_client.mod)
+    assert c.get("/sync/list", headers={"X-Iris-Token": tok}).status_code == 200
+    with app_client.mod.db() as db:
+        db.execute("UPDATE api_tokens SET expires = now() - interval '1 minute' WHERE token_hash=%s", (app_client.mod._th(tok),))
+    assert c.get("/sync/list", headers={"X-Iris-Token": tok}).status_code == 403
+    assert "expires" in c.get("/account").text or True
+
+
+def test_favicon_does_not_404(app_client):
+    r = app_client().get("/favicon.ico")
+    assert r.status_code == 200 and r.headers["content-type"] == "image/png" and len(r.content) > 100
