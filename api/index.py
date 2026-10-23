@@ -13,7 +13,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from iris import verify, render, pwa as W
 from iris.mascot import mascot
 from iris.transcribe import transcript_markdown
-from iris.webui import PAGE, esc, render_notes_md, render_transcript_line
+from iris.webui import PAGE, esc, render_notes_md, render_transcript_line, GRAPH_JS
+from iris.links import extract as extract_links
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -192,7 +193,7 @@ def sidebar(c, user, active=None):
           '<div style="padding:8px 12px"><a href="/login">Log in</a> &middot; <a href="/signup">Sign up</a></div>'
     return ('<input type=checkbox id=navtoggle><label for=navtoggle class=menubtn>Menu</label>'
             '<a href="/" style="text-decoration:none;color:inherit"><div class=brand>Iris<span id=tagline>meeting notes that keep receipts</span></div></a>'
-            + ('<a class="folder" href="/record" style="margin:6px 0"><span class=chev></span>Backup recorder</a>' if user else '')
+            + ('<a class="folder" href="/record" style="margin:6px 0"><span class=chev></span>Backup recorder</a><a class="folder" href="/graph" style="margin:0 0 6px"><span class=chev></span>Graph</a>' if user else '')
             + '<div class=nav>' + (f'<div class=nav-sec>Meetings</div>{items or "<div class=nav-meta style=padding:8px>Nothing recorded yet</div>"}' if user else '') + '</div>'
             + who
             + '<div class=themes><span class=lbl>Theme</span>' + ''.join(
@@ -703,6 +704,44 @@ def sync_pull(mid: str, req: Request):
         r = c.execute("SELECT bundle FROM synced WHERE user_id=%s AND id=%s", (u["id"], mid)).fetchone()
         return r["bundle"] if r else _err("not found", 404)
 
+def synced_linkmap(c, user_id):
+    """{normalized title: id} over a user's synced notes."""
+    import re as _re
+    rows = c.execute("SELECT id, bundle->'meta'->>'title' AS title FROM synced WHERE user_id=%s AND id NOT LIKE '\\_%%'", (user_id,)).fetchall()
+    out = {}
+    for r in rows:
+        t = _re.sub(r"\s+", " ", (r["title"] or r["id"]).strip().lower())
+        out.setdefault(t, r["id"])
+    return out
+
+@app.get("/graph", response_class=HTMLResponse)
+def graph_page(req: Request):
+    with db() as c:
+        u = current_user(c, req)
+        if not u: return RedirectResponse("/login", status_code=303)
+        rows = c.execute("SELECT id, bundle FROM synced WHERE user_id=%s AND id NOT LIKE '\\_%%'", (u["id"],)).fetchall()
+        lmap = synced_linkmap(c, u["id"])
+        import re as _re
+        nodes, edges, seen = [], [], set()
+        for r in rows:
+            b = r["bundle"]; meta = b.get("meta") or {}
+            nodes.append({"id": r["id"], "title": meta.get("title") or r["id"]})
+            if "notes" not in b:   # notes_age ciphertext: node only, we cannot read links
+                continue
+            for target, _label in extract_links(b["notes"]):
+                to = lmap.get(_re.sub(r"\s+", " ", target.strip().lower()))
+                if to and to != r["id"] and (r["id"], to) not in seen:
+                    seen.add((r["id"], to)); edges.append({"from": r["id"], "to": to})
+        g = {"nodes": nodes, "edges": edges}
+        meta_txt = (f'{len(nodes)} synced notes, {len(edges)} links. Drag nodes, click one to open it.' if edges
+                    else "No links yet. Write [[another note's title]] in a note on your device and sync.")
+        body = ('<h1 class=title style="font-size:30px">Note graph</h1>'
+                f"<p style='color:var(--muted);font-size:13.5px'>{meta_txt}</p>"
+                '<canvas id=graph style="width:100%;height:520px;border:1px solid var(--border);border-radius:12px;margin-top:6px"></canvas>'
+                '<script>window.__graph=' + json.dumps(g).replace("</", "<\\/") + ';</script>'
+                + GRAPH_JS.replace("/meeting/", "/n/"))
+        return render_page(c, u, body)
+
 # ---------- synced notes (viewer and editor) ----------
 @app.get("/n/{mid}", response_class=HTMLResponse)
 def synced_note(mid: str, req: Request):
@@ -714,7 +753,12 @@ def synced_note(mid: str, req: Request):
         b = r["bundle"]; meta = b.get("meta") or {}
         title = meta.get("title") or mid
         if "notes" in b:
-            body = render_notes_md(b["notes"])
+            lmap = synced_linkmap(c, u["id"])
+            def _resolve(target):
+                import re as _re
+                m2 = lmap.get(_re.sub(r"\s+", " ", target.strip().lower()))
+                return (f"/n/{m2}", True) if m2 else ("#", False)
+            body = render_notes_md(b["notes"], link_resolver=_resolve)
             edit = (f'<details class=drawer><summary>Edit notes</summary><form method=post action="/n/{esc(mid)}/edit">'
                     f'<textarea name=notes rows=16 style="width:100%;font:13.5px/1.5 ui-monospace,monospace;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)">{esc(b["notes"])}</textarea>'
                     '<p><button style="border:0;cursor:pointer;font:inherit;font-weight:600;padding:9px 18px;border-radius:999px;background:var(--accent);color:#fff">Save</button> '

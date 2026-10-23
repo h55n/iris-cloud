@@ -471,3 +471,40 @@ def test_non_html_gets_strict_csp(app_client):
     r = app_client().get("/sw.js")
     csp = r.headers["content-security-policy"]
     assert csp.endswith("script-src 'self'") and "nonce" not in csp  # style stays inline; scripts do not
+
+
+def _push_note(c, H, mid, title, notes):
+    b = {"id": mid, "meta": {"title": title, "created": 1.0}, "notes": notes}
+    assert c.post(f"/sync/push/{mid}", json=b, headers=H).status_code == 200
+
+
+def test_synced_notes_render_wikilinks_and_missing_links(app_client):
+    c = app_client(); signup(c)
+    H = {"X-Iris-Token": _token(c, app_client.mod)}
+    _push_note(c, H, "m-a", "Weekly sync", "# Weekly sync\n- discussed [[Roadmap]] and [[No such note]]")
+    _push_note(c, H, "m-b", "Roadmap", "# Roadmap\n- back to [[Weekly sync]]")
+    html = c.get("/n/m-a").text
+    assert '<a class=wikilink href="/n/m-b">Roadmap</a>' in html
+    assert '<span class="wikilink missing">No such note</span>' in html
+
+
+def test_cloud_graph_page_links_and_isolation(app_client):
+    a, b = app_client(), app_client()
+    signup(a)   # token helper binds the newest user, so push before making user b
+    Ha = {"X-Iris-Token": _token(a, app_client.mod)}
+    _push_note(a, Ha, "m-a", "Weekly sync", "# Weekly sync\n- see [[Roadmap]]")
+    _push_note(a, Ha, "m-b", "Roadmap", "# Roadmap\n- back to [[Weekly sync]]")
+    _push_note(a, Ha, "m-c", "Locked", "unused")
+    with app_client.mod.db() as db:   # turn m-c into a ciphertext bundle: node only, no edges
+        db.execute("UPDATE synced SET bundle = jsonb_build_object('meta', bundle->'meta', 'notes_age', 'AGE-1-fake') WHERE id='m-c'")
+    signup(b)
+    html = a.get("/graph").text
+    assert "window.__graph=" in html and "<canvas id=graph" in html
+    import json as J
+    data = J.loads(html.split("window.__graph=", 1)[1].split(";</script>", 1)[0].replace("<\\/", "</"))
+    assert {n["id"] for n in data["nodes"]} == {"m-a", "m-b", "m-c"}
+    edges = {(e["from"], e["to"]) for e in data["edges"]}
+    assert edges == {("m-a", "m-b"), ("m-b", "m-a")}      # no edges out of the ciphertext note
+    assert 'src="http' not in html and 'href="http' not in html   # fully self-contained
+    assert b.get("/graph").text.count('"nodes": []') == 1          # other user sees nothing of mine
+    assert app_client().get("/graph").status_code == 303           # logged out -> login
