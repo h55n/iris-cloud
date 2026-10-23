@@ -373,12 +373,13 @@ def test_per_ip_throttles(app_client):
     with A.db() as db: db.execute("DELETE FROM login_fail WHERE email LIKE 'ip-%%'")
     assert signup(c)[2].status_code == 200 and signup(c)[2].status_code == 200
     assert signup(c)[2].status_code == 400
+    ghost = f"nobody-{time.time_ns()}@iris-cloud.invalid"  # unique: the per-email throttle would otherwise count earlier suite runs in the shared local test DB
     for _ in range(3):
-        c.post("/login", data={"email": "nobody@iris-cloud.invalid", "password": "wrong-wrong"})
-    assert c.post("/login", data={"email": "other@iris-cloud.invalid", "password": "wrong-wrong"}).status_code == 429
+        c.post("/login", data={"email": ghost, "password": "wrong-wrong"})
+    assert c.post("/login", data={"email": f"other-{time.time_ns()}@iris-cloud.invalid", "password": "wrong-wrong"}).status_code == 429
     for _ in range(2):
-        c.post("/reset", data={"email": "n1@iris-cloud.invalid", "code": "0000-0000-0000-0000", "password": "brand-new-pass"})
-    assert c.post("/reset", data={"email": "n2@iris-cloud.invalid", "code": "0000-0000-0000-0000", "password": "brand-new-pass"}).status_code == 429
+        c.post("/reset", data={"email": f"n1-{time.time_ns()}@iris-cloud.invalid", "code": "0000-0000-0000-0000", "password": "brand-new-pass"})
+    assert c.post("/reset", data={"email": f"n2-{time.time_ns()}@iris-cloud.invalid", "code": "0000-0000-0000-0000", "password": "brand-new-pass"}).status_code == 429
 
 
 def test_notes_and_titles_are_escaped_in_the_viewer(app_client):
@@ -399,7 +400,7 @@ def test_notes_and_titles_are_escaped_in_the_viewer(app_client):
 def test_login_response_does_not_reveal_which_emails_exist(app_client):
     c = app_client(); email, pw, _ = signup(c)
     a = c.post("/login", data={"email": email, "password": "wrong-wrong"})
-    b = c.post("/login", data={"email": "ghost@iris-cloud.invalid", "password": "wrong-wrong"})
+    b = c.post("/login", data={"email": f"ghost-{time.time_ns()}@iris-cloud.invalid", "password": "wrong-wrong"})
     assert a.status_code == b.status_code == 401 and "Wrong email or password" in a.text and "Wrong email or password" in b.text
 
 
