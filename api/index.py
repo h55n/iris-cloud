@@ -1213,8 +1213,14 @@ def synced_note(mid: str, req: Request):
 
 CT_KEYS = ("v", "alg", "kdf", "iter", "salt", "iv", "ct")
 def _valid_ct(d, max_len=400_000):
-    return (isinstance(d, dict) and d.get("v") == 1 and d.get("alg") == "AES-GCM"
-            and d.get("kdf") == "PBKDF2-SHA256" and 100_000 <= int(d.get("iter", 0)) <= 2_000_000
+    if not isinstance(d, dict):
+        return False
+    try:
+        iterations = int(d.get("iter", 0))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (d.get("v") == 1 and d.get("alg") == "AES-GCM"
+            and d.get("kdf") == "PBKDF2-SHA256" and 100_000 <= iterations <= 2_000_000
             and all(isinstance(d.get(k), str) for k in ("salt", "iv", "ct")) and len(d.get("ct", "")) <= max_len)
 
 @app.post("/n/{mid}/browser-encrypt")
